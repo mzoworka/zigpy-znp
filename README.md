@@ -20,7 +20,7 @@ $ source venv/bin/activate
 ```
 
 ## Home Assistant
-Stable releases of zigpy-znp are included with Home Assistant and zigpy-znp is currently used by all new ZHA integration setups. If you have previously setup Home Assistant's ZHA component with a TI radio, ZHA may be using the [zigpy-cc](https://github.com/zigpy/zigpy-cc/) library to communicate with the radio hardware. Navigate to the folder containing your `configuration.yaml` file, edit `.storage/core.config_entries`, and change `"radio_type": "ti_cc"` to `"radio_type": "znp"`.
+Stable releases of zigpy-znp are automatically installed when you install the ZHA component.
 
 ### Testing `dev` with Home Assistant Core
 
@@ -30,21 +30,22 @@ Upgrade the package within your virtual environment (requires `git`):
 (venv) $ pip install git+https://github.com/zigpy/zigpy-znp/
 ```
 
-Launch Home Assistant the `--skip-pip` command line option to prevent zigpy-znp from being downgraded. Running with this option may prevent newly added integrations from installing required packages.
+Launch Home Assistant with the `--skip-pip` command line option to prevent zigpy-znp from being downgraded. Running with this option may prevent newly added integrations from installing required packages.
 
 ### Testing `dev` with Home Assistant OS
 
  - Add https://github.com/home-assistant/hassio-addons-development as an addon repository.
  - Install the "Custom deps deployment" addon.
  - Add the following to your `configuration.yaml` file:
-	```yaml
-	pypi:
-	  - git+https://github.com/zigpy/zigpy-znp/
-	```
+   ```yaml
+   apk: []
+   pypi:
+     - git+https://github.com/zigpy/zigpy-znp/
+	 ```
 
 # Configuration
 Below are the defaults with the top-level Home Assistant `zha:` key.
-You do not need to copy this configuration, it is provided only for reference:
+**You do not need to copy this configuration, it is provided only for reference**:
 
 ```yaml
 zha:
@@ -54,13 +55,14 @@ zha:
       max_concurrent_requests: auto
 
       # Only if your stick has a built-in power amplifier (i.e. CC1352P and CC2592)
-      # If set, must be between -22 (low) and 19 (high)
+      # If set, must be between:
+      #  * CC1352/2652:  -22 and 19
+      #  * CC253x:       -22 and 22
       tx_power:  
 
       # Only if your stick has a controllable LED (the CC2531)
-      # If set, must be one of: "off", "on", blink, flash, toggle
-      #                   Note: "off" and "on" must be quoted!
-      led_mode:  "off"
+      # If set, must be one of: off, on, blink, flash, toggle
+      led_mode: off
 
 
       ### Internal configuration, there's no reason to touch these values
@@ -76,6 +78,10 @@ zha:
 
       # Delay between auto-reconnect attempts in case the device gets disconnected
       auto_reconnect_retry_delay: 5
+
+      # Pin states for skipping the bootloader
+      connect_rts_pin_states: [off, on, off]
+      connect_dtr_pin_states: [off, off, off]
 ```
 
 # Tools
@@ -95,11 +101,21 @@ in **[`TOOLS.md`](./TOOLS.md)** but a brief description of each tool is included
  - **`nvram_write`**: Writes all NVRAM entries from a JSON document.
 
 # Hardware requirements
-USB-adapters, GPIO-modules, and development-boards running TI's Z-Stack are supported. Reference hardware for this project includes:
+USB-adapters, GPIO-modules, and development-boards flashed with TI's Z-Stack are compatible with zigpy-znp:
+
+ - CC2652P/CC2652R/CC2652RB USB stick and dev board hardware
+ - CC1352P/CC1352R USB stick and dev board hardware
+ - CC2538 + CC2592 USB stick and dev board hardware (**not recommended, old hardware and end-of-life firmware**)
+ - CC2531 USB stick hardware (**not recommended for Zigbee networks with more than 20 devices**)
+ - CC2530 + CC2591/CC2592 USB stick hardware (**not recommended for Zigbee networks with more than 20 devices**)
+
+Tip! Adapters listed as "[Texas Instruments sticks compatible with Zigbee2MQTT](https://www.zigbee2mqtt.io/information/supported_adapters)" also works with zigpy-znp.
+
+## Reference hardware for this project
+These specific adapters are used as reference hardware for development and testing by zigpy-znp developers:
 
  - [TI LAUNCHXL-CC26X2R1](https://www.ti.com/tool/LAUNCHXL-CC26X2R1) running [Z-Stack 3 firmware (based on version 4.40.00.44)](https://github.com/Koenkk/Z-Stack-firmware/tree/master/coordinator/Z-Stack_3.x.0/bin). You can flash `CC2652R_20210120.hex` using [TI's UNIFLASH](https://www.ti.com/tool/download/UNIFLASH).
  - [Electrolama zzh CC2652R](https://electrolama.com/projects/zig-a-zig-ah/) and [Slaesh CC2652R](https://slae.sh/projects/cc2652/) sticks running [Z-Stack 3 firmware (based on version 4.40.00.44)](https://github.com/Koenkk/Z-Stack-firmware/tree/master/coordinator/Z-Stack_3.x.0/bin). You can flash `CC2652R_20210120.hex` or `CC2652RB_20210120.hex` respectively using [cc2538-bsl](https://github.com/JelmerT/cc2538-bsl).
- - CC2531 running [Z-Stack 3.0.1](https://github.com/Koenkk/Z-Stack-firmware/blob/master/coordinator/Z-Stack_3.0.x/bin/CC2531_20190425.zip). You can flash `CC2531ZNP-without-SBL.bin` to your stick directly with `zigpy_znp`: `python -m zigpy_znp.tools.flash_write -i /path/to/CC2531ZNP-without-SBL.bin /dev/serial/by-id/YOUR-CC2531` if your stick already has a serial bootloader.
  - CC2531 running [Z-Stack Home 1.2](https://github.com/Koenkk/Z-Stack-firmware/blob/master/coordinator/Z-Stack_Home_1.2/bin/default/CC2531_DEFAULT_20190608.zip). You can flash `CC2531ZNP-Prod.bin` to your stick directly with `zigpy_znp`: `python -m zigpy_znp.tools.flash_write -i /path/to/CC2531ZNP-Prod.bin /dev/serial/by-id/YOUR-CC2531` if your stick already has a serial bootloader.
 
 ## Texas Instruments Chip Part Numbers
@@ -122,7 +138,7 @@ Texas Instruments (TI) has quite a few different wireless MCU chips and they are
 - CC2530: 2.4GHz Zigbee and IEEE 802.15.4 wireless MCU. Intel 8051 core, 256 Flash, only has 8kB RAM.
 
 ### Auxiliary TI chips
-- CC2591 and CC2592: 2.4 GHz range extenders. These are not wireless MCUs, just auxillary PA (Power Amplifier) and LNA (Low Noise Amplifier) in the same package to improve RF (Radio Frequency) range of any 2.4 GHz radio chip.
+- CC2591 and CC2592: 2.4 GHz range extenders. These are not wireless MCUs, just auxiliary PA (Power Amplifier) and LNA (Low Noise Amplifier) in the same package to improve RF (Radio Frequency) range of any 2.4 GHz radio chip.
 
 # Releases via PyPI
 

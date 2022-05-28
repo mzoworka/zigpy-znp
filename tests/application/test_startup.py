@@ -4,6 +4,7 @@ import zigpy_znp.types as t
 import zigpy_znp.config as conf
 import zigpy_znp.commands as c
 from zigpy_znp.api import ZNP
+from zigpy_znp.exceptions import InvalidCommandResponse
 from zigpy_znp.types.nvids import ExNvIds, OsalNvIds
 
 from ..conftest import (
@@ -17,32 +18,30 @@ from ..conftest import (
     FormedLaunchpadCC26X2R1,
 )
 
-pytestmark = [pytest.mark.asyncio]
-
 DEV_NETWORK_SETTINGS = {
     FormedLaunchpadCC26X2R1: (
-        "CC13X2/CC26X2, Z-Stack 3.30.00/3.40.00/4.10.00",
+        f"CC1352/CC2652, Z-Stack 3.30+ (build {FormedLaunchpadCC26X2R1.code_revision})",
         15,
         t.Channels.from_channel_list([15]),
-        0x9B21,
-        t.EUI64.convert("f4:4b:c6:c8:d6:12:2e:8f"),
-        t.KeyData(bytes.fromhex("121ec4cce6d6ad81c822b8e2bf707227")),
+        0x4402,
+        t.EUI64.convert("A2:BA:38:A8:B5:E6:83:A0"),
+        t.KeyData.convert("4C:4E:72:B8:41:22:51:79:9A:BF:35:25:12:88:CA:83"),
     ),
     FormedZStack3CC2531: (
-        "CC2531, Z-Stack 3.0.1/3.0.2",
+        f"CC2531, Z-Stack 3.0.x (build {FormedZStack3CC2531.code_revision})",
         15,
         t.Channels.from_channel_list([15]),
         0xB6AB,
-        t.EUI64.convert("62:92:32:46:3c:77:2d:b2"),
-        t.KeyData(bytes.fromhex("6dde24eae28552b6de2956eb05851afa")),
+        t.EUI64.convert("62:92:32:46:3C:77:2D:B2"),
+        t.KeyData.convert("6D:DE:24:EA:E2:85:52:B6:DE:29:56:EB:05:85:1A:FA"),
     ),
     FormedZStack1CC2531: (
-        "CC2531, Z-Stack Home 1.2",
-        15,
-        t.Channels.from_channel_list([15]),
-        0x1F1C,
-        t.EUI64.convert("bf:00:dc:3b:60:4b:21:74"),
-        t.KeyData(bytes.fromhex("b133fd66f718179ffd767b3cc5765a60")),
+        f"CC2531, Z-Stack Home 1.2 (build {FormedZStack1CC2531.code_revision})",
+        11,
+        t.Channels.from_channel_list([11]),
+        0x1A62,
+        t.EUI64.convert("DD:DD:DD:DD:DD:DD:DD:DD"),
+        t.KeyData([1, 3, 5, 7, 9, 11, 13, 15, 0, 2, 4, 6, 8, 10, 12, 13]),
     ),
 }
 
@@ -53,24 +52,38 @@ DEV_NETWORK_SETTINGS = {
     [(device_cls,) + settings for device_cls, settings in DEV_NETWORK_SETTINGS.items()],
 )
 async def test_info(
-    device, model, channel, channels, pan_id, ext_pan_id, network_key, make_application
+    device,
+    model,
+    channel,
+    channels,
+    pan_id,
+    ext_pan_id,
+    network_key,
+    make_application,
+    caplog,
 ):
     app, znp_server = make_application(server_cls=device)
 
     # These should not raise any errors even if our NIB is empty
-    assert app.pan_id is None
-    assert app.extended_pan_id is None
+    assert app.pan_id == 0xFFFE  # unknown NWK ID
+    assert app.extended_pan_id == t.EUI64.convert("ff:ff:ff:ff:ff:ff:ff:ff")
     assert app.channel is None
     assert app.channels is None
-    assert app.network_key is None
+    assert app.state.network_information.network_key is None
 
     await app.startup(auto_form=False)
+
+    if network_key == t.KeyData([1, 3, 5, 7, 9, 11, 13, 15, 0, 2, 4, 6, 8, 10, 12, 13]):
+        assert "Your network is using the insecure" in caplog.text
+    else:
+        assert "Your network is using the insecure" not in caplog.text
 
     assert app.pan_id == pan_id
     assert app.extended_pan_id == ext_pan_id
     assert app.channel == channel
     assert app.channels == channels
-    assert app.network_key == network_key
+    assert app.state.network_information.network_key.key == network_key
+    assert app.state.network_information.network_key.seq == 0
 
     assert app.zigpy_device.manufacturer == "Texas Instruments"
     assert app.zigpy_device.model == model
@@ -148,43 +161,77 @@ async def test_write_nvram(device, make_application, mocker):
 
 
 @pytest.mark.parametrize("device", FORMED_DEVICES)
-async def test_tx_power(device, make_application):
+@pytest.mark.parametrize("succeed", [True, False])
+async def test_tx_power(device, succeed, make_application):
     app, znp_server = make_application(
         server_cls=device,
         client_config={conf.CONF_ZNP_CONFIG: {conf.CONF_TX_POWER: 19}},
     )
 
-    set_tx_power = znp_server.reply_once_to(
-        request=c.SYS.SetTxPower.Req(TXPower=19),
-        responses=[c.SYS.SetTxPower.Rsp(Status=t.Status.SUCCESS)],
-    )
+    if device.version == 3.30:
+        if succeed:
+            set_tx_power = znp_server.reply_once_to(
+                request=c.SYS.SetTxPower.Req(TXPower=19),
+                responses=[c.SYS.SetTxPower.Rsp(StatusOrPower=t.Status.SUCCESS)],
+            )
+        else:
+            set_tx_power = znp_server.reply_once_to(
+                request=c.SYS.SetTxPower.Req(TXPower=19),
+                responses=[
+                    c.SYS.SetTxPower.Rsp(
+                        StatusOrPower=t.Status.MAC_INVALID_PARAMETER - 0xFF - 1
+                    )
+                ],
+            )
+    else:
+        if succeed:
+            set_tx_power = znp_server.reply_once_to(
+                request=c.SYS.SetTxPower.Req(TXPower=19),
+                responses=[c.SYS.SetTxPower.Rsp(StatusOrPower=19)],
+            )
+        else:
+            set_tx_power = znp_server.reply_once_to(
+                request=c.SYS.SetTxPower.Req(TXPower=19),
+                responses=[c.SYS.SetTxPower.Rsp(StatusOrPower=-1)],  # adjusted
+            )
 
-    await app.startup(auto_form=False)
-    await set_tx_power
+    if device.version == 3.30 and not succeed:
+        with pytest.raises(InvalidCommandResponse):
+            await app.startup(auto_form=False)
+
+        await set_tx_power
+    else:
+        await app.startup(auto_form=False)
+        await set_tx_power
 
     await app.shutdown()
 
 
+@pytest.mark.parametrize("led_mode", ["off", False, "on", True])
 @pytest.mark.parametrize("device", FORMED_DEVICES)
-async def test_led_mode(device, make_application):
+async def test_led_mode(device, led_mode, make_application):
     app, znp_server = make_application(
         server_cls=device,
-        client_config={conf.CONF_ZNP_CONFIG: {conf.CONF_LED_MODE: "off"}},
+        client_config={conf.CONF_ZNP_CONFIG: {conf.CONF_LED_MODE: led_mode}},
     )
 
     # Z-Stack just does not respond to this command if HAL_LED is not enabled
     # It does not send the usual "command not recognized" response
     set_led_mode = znp_server.reply_once_to(
-        request=c.Util.LEDControl.Req(partial=True),
+        request=c.UTIL.LEDControl.Req(partial=True),
         responses=[]
         if device is FormedLaunchpadCC26X2R1
-        else [c.Util.LEDControl.Rsp(Status=t.Status.SUCCESS)],
+        else [c.UTIL.LEDControl.Rsp(Status=t.Status.SUCCESS)],
     )
 
     await app.startup(auto_form=False)
     led_req = await set_led_mode
 
-    assert led_req.Mode == c.util.LEDMode.OFF
+    if led_mode in ("off", False):
+        assert led_req.Mode == c.util.LEDMode.OFF
+    else:
+        assert led_req.Mode == c.util.LEDMode.ON
+
     assert led_req.LED == 0xFF
 
     await app.shutdown()
@@ -223,5 +270,33 @@ async def test_auto_form_necessary(device, make_application, mocker):
 
     assert nvram[OsalNvIds.LOGICAL_TYPE] == t.DeviceLogicalType.Coordinator.serialize()
     assert nvram[OsalNvIds.ZDO_DIRECT_CB] == t.Bool(True).serialize()
+
+    await app.shutdown()
+
+
+@pytest.mark.parametrize("device", [FormedZStack1CC2531])
+async def test_zstack_build_id_empty(device, make_application, mocker):
+    app, znp_server = make_application(server_cls=device)
+
+    znp_server.reply_once_to(
+        c.SYS.Version.Req(),
+        responses=c.SYS.Version.Rsp(
+            TransportRev=2,
+            ProductId=0,
+            MajorRel=2,
+            MinorRel=6,
+            MaintRel=3,
+            # These are missing
+            CodeRevision=None,
+            BootloaderBuildType=None,
+            BootloaderRevision=None,
+        ),
+        override=True,
+    )
+
+    await app.startup(auto_form=True)
+
+    assert app._zstack_build_id is not None
+    assert app._zstack_build_id == 0x00000000
 
     await app.shutdown()

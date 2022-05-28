@@ -1,6 +1,11 @@
+import typing
+
 import pytest
 
 import zigpy_znp.types as t
+
+if typing.TYPE_CHECKING:
+    import typing_extensions
 
 
 def test_struct_fields():
@@ -31,7 +36,7 @@ def test_struct_field_values():
 
     # Invalid values can't be passed during construction
     with pytest.raises(ValueError):
-        TestStruct(a=1, b=2 ** 32)
+        TestStruct(a=1, b=2**32)
 
     struct2 = TestStruct()
     struct2.a = 1
@@ -266,7 +271,7 @@ def test_struct_incomplete_serialization():
 
 
 def test_old_nib_deserialize():
-    PaddingByte = t.uint8_t
+    PaddingByte: typing_extensions.TypeAlias = t.uint8_t
 
     class NwkState16(t.enum_uint16):
         NWK_INIT = 0
@@ -330,11 +335,11 @@ def test_old_nib_deserialize():
         nwkConcentratorDiscoveryTime: t.uint8_t
         nwkConcentratorRadius: t.uint8_t
         nwkAllFresh: t.uint8_t
-        PaddingByte3: PaddingByte
+        PaddingByte3: PaddingByte  # type:ignore[valid-type]
         nwkManagerAddr: t.NWK
         nwkTotalTransmissions: t.uint16_t
         nwkUpdateId: t.uint8_t
-        PaddingByte4: PaddingByte
+        PaddingByte4: PaddingByte  # type:ignore[valid-type]
 
     nib = t.NIB(
         SequenceNum=54,
@@ -405,3 +410,12 @@ def test_old_nib_deserialize():
     # And they are deserialized correctly
     for field in nib.fields:
         assert getattr(nib, field.name) == getattr(old_nib, field.name)
+
+
+def test_struct_addrmode_address():
+    class TestStruct(t.CStruct):
+        addr: t.AddrModeAddress
+
+    struct = TestStruct(addr=t.AddrModeAddress(mode=t.AddrMode.NWK, address=0x1234))
+    assert struct.get_size(align=False) == 1 + 8
+    assert struct.get_size(align=True) == 1 + 8

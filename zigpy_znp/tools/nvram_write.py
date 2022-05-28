@@ -2,21 +2,16 @@ import sys
 import json
 import asyncio
 import logging
-import argparse
 
 from zigpy_znp.api import ZNP
 from zigpy_znp.config import CONFIG_SCHEMA
 from zigpy_znp.types.nvids import ExNvIds, OsalNvIds
-from zigpy_znp.tools.common import setup_parser
+from zigpy_znp.tools.common import ClosableFileType, setup_parser
 
 LOGGER = logging.getLogger(__name__)
 
 
-async def restore(radio_path, backup):
-    znp = ZNP(CONFIG_SCHEMA({"device": {"path": radio_path}}))
-
-    await znp.connect()
-
+async def nvram_write(znp: ZNP, backup):
     # First write the NVRAM items common to all radios
     for nwk_nvid, value in backup["LEGACY"].items():
         if "+" in nwk_nvid:
@@ -25,9 +20,14 @@ async def restore(radio_path, backup):
             nvid = OsalNvIds[nwk_nvid] + offset
         else:
             nvid = OsalNvIds[nwk_nvid]
+            offset = None
 
-        value = bytes.fromhex(value)
-        await znp.nvram.osal_write(nvid, value, create=True)
+        if offset is not None:
+            LOGGER.info("%s+%s = %r", OsalNvIds[nwk_nvid].name, offset, value)
+        else:
+            LOGGER.info("%s = %r", OsalNvIds[nwk_nvid].name, value)
+
+        await znp.nvram.osal_write(nvid, bytes.fromhex(value), create=True)
 
     for item_name, sub_ids in backup.items():
         item_id = ExNvIds[item_name]
@@ -37,12 +37,12 @@ async def restore(radio_path, backup):
 
         for sub_id, value in sub_ids.items():
             sub_id = int(sub_id, 16)
-            value = bytes.fromhex(value)
+            LOGGER.info("%s[0x%04X] = %r", item_id.name, sub_id, value)
 
             await znp.nvram.write(
                 item_id=item_id,
                 sub_id=sub_id,
-                value=value,
+                value=bytes.fromhex(value),
                 create=True,
             )
 
@@ -53,12 +53,18 @@ async def restore(radio_path, backup):
 async def main(argv):
     parser = setup_parser("Restore a radio's NVRAM from a previous backup")
     parser.add_argument(
-        "--input", "-i", type=argparse.FileType("r"), help="Input file", required=True
+        "--input", "-i", type=ClosableFileType("r"), help="Input file", required=True
     )
 
     args = parser.parse_args(argv)
-    backup = json.load(args.input)
-    await restore(args.serial, backup)
+
+    with args.input as f:
+        backup = json.load(f)
+
+    znp = ZNP(CONFIG_SCHEMA({"device": {"path": args.serial}}))
+    await znp.connect()
+
+    await nvram_write(znp, backup)
 
 
 if __name__ == "__main__":

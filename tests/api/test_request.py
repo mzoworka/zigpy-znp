@@ -10,8 +10,6 @@ import zigpy_znp.commands as c
 from zigpy_znp.frames import GeneralFrame
 from zigpy_znp.exceptions import CommandNotRecognized, InvalidCommandResponse
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def test_callback_rsp(connected_znp, event_loop):
     znp, znp_server = connected_znp
@@ -52,44 +50,44 @@ async def test_cleanup_timeout_internal(connected_znp):
     znp._config[conf.CONF_ZNP_CONFIG][conf.CONF_SREQ_TIMEOUT] = 0.1
     znp._config[conf.CONF_ZNP_CONFIG][conf.CONF_ARSP_TIMEOUT] = 0.1
 
-    assert not znp._listeners
+    assert not any(znp._listeners.values())
 
     with pytest.raises(asyncio.TimeoutError):
-        await znp.request(c.Util.TimeAlive.Req())
+        await znp.request(c.UTIL.TimeAlive.Req())
 
     # We should be cleaned up
-    assert not znp._listeners
+    assert not any(znp._listeners.values())
 
 
 async def test_cleanup_timeout_external(connected_znp):
     znp, znp_server = connected_znp
 
-    assert not znp._listeners
+    assert not any(znp._listeners.values())
 
     # This request will timeout because we didn't send anything back
     with pytest.raises(asyncio.TimeoutError):
         async with async_timeout.timeout(0.1):
-            await znp.request(c.Util.TimeAlive.Req())
+            await znp.request(c.UTIL.TimeAlive.Req())
 
     # We should be cleaned up
-    assert not znp._listeners
+    assert not any(znp._listeners.values())
 
 
 async def test_callback_rsp_cleanup_timeout_external(connected_znp):
     znp, znp_server = connected_znp
 
-    assert not znp._listeners
+    assert not any(znp._listeners.values())
 
     # This request will timeout because we didn't send anything back
     with pytest.raises(asyncio.TimeoutError):
         async with async_timeout.timeout(0.1):
             await znp.request_callback_rsp(
-                request=c.Util.TimeAlive.Req(),
+                request=c.UTIL.TimeAlive.Req(),
                 callback=c.SYS.ResetInd.Callback(partial=True),
             )
 
     # We should be cleaned up
-    assert not znp._listeners
+    assert not any(znp._listeners.values())
 
 
 @pytest.mark.parametrize("background", [False, True])
@@ -98,56 +96,58 @@ async def test_callback_rsp_cleanup_timeout_internal(background, connected_znp):
     znp._config[conf.CONF_ZNP_CONFIG][conf.CONF_SREQ_TIMEOUT] = 0.1
     znp._config[conf.CONF_ZNP_CONFIG][conf.CONF_ARSP_TIMEOUT] = 0.1
 
-    assert not znp._listeners
+    assert not any(znp._listeners.values())
 
     # This request will timeout because we didn't send anything back
     with pytest.raises(asyncio.TimeoutError):
         await znp.request_callback_rsp(
-            request=c.Util.TimeAlive.Req(),
+            request=c.UTIL.TimeAlive.Req(),
             callback=c.SYS.ResetInd.Callback(partial=True),
             background=background,
         )
 
     # We should be cleaned up
-    assert not znp._listeners
+    assert not any(znp._listeners.values())
 
 
-async def test_callback_rsp_cleanup_background_error(connected_znp):
+async def test_callback_rsp_background_timeout(connected_znp, mocker):
     znp, znp_server = connected_znp
     znp._config[conf.CONF_ZNP_CONFIG][conf.CONF_SREQ_TIMEOUT] = 0.1
-    znp._config[conf.CONF_ZNP_CONFIG][conf.CONF_ARSP_TIMEOUT] = 0.1
+    znp._config[conf.CONF_ZNP_CONFIG][conf.CONF_ARSP_TIMEOUT] = 1.0
 
-    assert not znp._listeners
+    mocker.spy(znp, "_unhandled_command")
 
-    # This request will timeout because we didn't send anything back
-    with pytest.raises(asyncio.TimeoutError):
-        await znp.request_callback_rsp(
-            request=c.Util.TimeAlive.Req(),
-            callback=c.SYS.ResetInd.Callback(partial=True),
-            background=True,
+    async def replier(req):
+        # SREQ reply works
+        await asyncio.sleep(0.05)
+        yield c.UTIL.TimeAlive.Rsp(Seconds=123)
+
+        # And the callback will arrive before the AREQ timeout
+        await asyncio.sleep(0.9)
+        yield c.SYS.ResetInd.Callback(
+            Reason=t.ResetReason.PowerUp,
+            TransportRev=0x00,
+            ProductId=0x12,
+            MajorRel=0x01,
+            MinorRel=0x02,
+            MaintRel=0x03,
         )
 
-    # We should be cleaned up
-    assert not znp._listeners
+    reply = znp_server.reply_once_to(c.UTIL.TimeAlive.Req(), responses=replier)
 
+    await znp.request_callback_rsp(
+        request=c.UTIL.TimeAlive.Req(),
+        callback=c.SYS.ResetInd.Callback(partial=True),
+        background=True,
+    )
 
-async def test_callback_rsp_cleanup_background_timeout(connected_znp):
-    znp, znp_server = connected_znp
-    znp._config[conf.CONF_ZNP_CONFIG][conf.CONF_SREQ_TIMEOUT] = 0.1
-    znp._config[conf.CONF_ZNP_CONFIG][conf.CONF_ARSP_TIMEOUT] = 0.1
-
-    assert not znp._listeners
-
-    # This request will timeout because we didn't send anything back
-    with pytest.raises(asyncio.TimeoutError):
-        await znp.request_callback_rsp(
-            request=c.Util.TimeAlive.Req(),
-            callback=c.SYS.ResetInd.Callback(partial=True),
-            background=True,
-        )
+    await reply
 
     # We should be cleaned up
-    assert not znp._listeners
+    assert not any(znp._listeners.values())
+
+    # Command was properly handled
+    assert len(znp._unhandled_command.mock_calls) == 0
 
 
 async def test_callback_rsp_cleanup_concurrent(connected_znp, event_loop, mocker):
@@ -155,30 +155,30 @@ async def test_callback_rsp_cleanup_concurrent(connected_znp, event_loop, mocker
 
     mocker.spy(znp, "_unhandled_command")
 
-    assert not znp._listeners
+    assert not any(znp._listeners.values())
 
     def send_responses():
-        znp_server.send(c.Util.TimeAlive.Rsp(Seconds=123))
-        znp_server.send(c.Util.TimeAlive.Rsp(Seconds=456))
+        znp_server.send(c.UTIL.TimeAlive.Rsp(Seconds=123))
+        znp_server.send(c.UTIL.TimeAlive.Rsp(Seconds=456))
         znp_server.send(c.SYS.OSALTimerExpired.Callback(Id=0xAB))
         znp_server.send(c.SYS.OSALTimerExpired.Callback(Id=0xCD))
 
     event_loop.call_soon(send_responses)
 
     callback_rsp = await znp.request_callback_rsp(
-        request=c.Util.TimeAlive.Req(),
+        request=c.UTIL.TimeAlive.Req(),
         callback=c.SYS.OSALTimerExpired.Callback(partial=True),
     )
 
     # We should be cleaned up
-    assert not znp._listeners
+    assert not any(znp._listeners.values())
 
     assert callback_rsp == c.SYS.OSALTimerExpired.Callback(Id=0xAB)
 
     # Even though all four requests were sent in the same tick, they should be handled
     # correctly by request_callback_rsp and in the correct order
     assert znp._unhandled_command.mock_calls == [
-        mocker.call(c.Util.TimeAlive.Rsp(Seconds=456)),
+        mocker.call(c.UTIL.TimeAlive.Rsp(Seconds=456)),
         mocker.call(c.SYS.OSALTimerExpired.Callback(Id=0xCD)),
     ]
 
@@ -262,7 +262,7 @@ async def test_znp_sreq_srsp(connected_znp, event_loop):
 
     # Each SREQ must have a corresponding SRSP, so this will fail
     with pytest.raises(asyncio.TimeoutError):
-        with async_timeout.timeout(0.5):
+        async with async_timeout.timeout(0.5):
             await znp.request(c.SYS.Ping.Req())
 
     # This will work
@@ -285,3 +285,36 @@ async def test_znp_unknown_frame(connected_znp, caplog):
 
     # Unknown frames are logged in their entirety but an error is not thrown
     assert repr(frame) in caplog.text
+
+
+async def test_handling_known_bad_command_parsing(connected_znp, caplog):
+    znp, _ = connected_znp
+
+    bad_frame = GeneralFrame(
+        header=t.CommandHeader(
+            id=0x9F, subsystem=t.Subsystem.ZDO, type=t.CommandType.AREQ
+        ),
+        data=b"\x13\xDB\x84\x01\x21",
+    )
+
+    caplog.set_level(logging.WARNING)
+    znp.frame_received(bad_frame)
+
+    # The frame is expected to fail to parse so will be logged as only a warning
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelname == "WARNING"
+    assert repr(bad_frame) in caplog.messages[0]
+
+
+async def test_handling_unknown_bad_command_parsing(connected_znp):
+    znp, _ = connected_znp
+
+    bad_frame = GeneralFrame(
+        header=t.CommandHeader(
+            id=0xCB, subsystem=t.Subsystem.ZDO, type=t.CommandType.AREQ
+        ),
+        data=b"\x13\xDB\x84\x01\x21",
+    )
+
+    with pytest.raises(ValueError):
+        znp.frame_received(bad_frame)

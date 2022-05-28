@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import os
 import time
 import typing
 import asyncio
@@ -7,162 +10,39 @@ import contextlib
 import dataclasses
 from collections import Counter, defaultdict
 
+import zigpy.state
 import async_timeout
+import zigpy.zdo.types as zdo_t
 
+import zigpy_znp.const as const
 import zigpy_znp.types as t
 import zigpy_znp.config as conf
 import zigpy_znp.logger as log
 import zigpy_znp.commands as c
 from zigpy_znp import uart
 from zigpy_znp.nvram import NVRAMHelper
+from zigpy_znp.utils import (
+    CatchAllResponse,
+    BaseResponseListener,
+    OneShotResponseListener,
+    CallbackResponseListener,
+)
 from zigpy_znp.frames import GeneralFrame
-from zigpy_znp.znp.utils import NetworkInfo, load_network_info, detect_zstack_version
 from zigpy_znp.exceptions import CommandNotRecognized, InvalidCommandResponse
+from zigpy_znp.types.nvids import ExNvIds, OsalNvIds
+
+if typing.TYPE_CHECKING:
+    import typing_extensions
 
 LOGGER = logging.getLogger(__name__)
-AFTER_CONNECT_DELAY = 1  # seconds
-STARTUP_DELAY = 1  # seconds
 
 
-def _deduplicate_commands(
-    commands: typing.Iterable[t.CommandBase],
-) -> typing.Tuple[t.CommandBase]:
-    """
-    Deduplicates an iterable of commands by folding more-specific commands into less-
-    specific commands. Used to avoid triggering callbacks multiple times per packet.
-    """
-
-    # We essentially need to find the "maximal" commands, if you treat the relationship
-    # between two commands as a partial order.
-    maximal_commands = []
-
-    # Command matching as a relation forms a partially ordered set.
-    for command in commands:
-        for index, other_command in enumerate(maximal_commands):
-            if other_command.matches(command):
-                # If the other command matches us, we are redundant
-                break
-            elif command.matches(other_command):
-                # If we match another command, we replace it
-                maximal_commands[index] = command
-                break
-            else:
-                # Otherwise, we keep looking
-                continue  # pragma: no cover
-        else:
-            # If we matched nothing and nothing matched us, we extend the list
-            maximal_commands.append(command)
-
-    # The start of each chain is the maximal element
-    return tuple(maximal_commands)
-
-
-@dataclasses.dataclass(frozen=True)
-class BaseResponseListener:
-    matching_commands: typing.Tuple[t.CommandBase]
-
-    def __post_init__(self):
-        commands = _deduplicate_commands(self.matching_commands)
-
-        if not commands:
-            raise ValueError("Cannot create a listener without any matching commands")
-
-        # We're frozen so __setattr__ is disallowed
-        object.__setattr__(self, "matching_commands", commands)
-
-    def matching_headers(self) -> typing.Set[t.CommandHeader]:
-        """
-        Returns the set of Z-Stack MT command headers for all the matching commands.
-        """
-
-        return {response.header for response in self.matching_commands}
-
-    def resolve(self, response: t.CommandBase) -> bool:
-        """
-        Attempts to resolve the listener with a given response. Can be called with any
-        command as an argument, including ones we don't match.
-        """
-
-        if not any(c.matches(response) for c in self.matching_commands):
-            return False
-
-        return self._resolve(response)
-
-    def _resolve(self, response: t.CommandBase) -> bool:
-        """
-        Implemented by subclasses to handle matched commands.
-
-        Return value indicates whether or not the listener has actually resolved,
-        which can sometimes be unavoidable.
-        """
-
-        raise NotImplementedError()  # pragma: no cover
-
-    def cancel(self):
-        """
-        Implement by subclasses to cancel the listener.
-
-        Return value indicates whether or not the listener is cancelable.
-        """
-
-        raise NotImplementedError()  # pragma: no cover
-
-
-@dataclasses.dataclass(frozen=True)
-class OneShotResponseListener(BaseResponseListener):
-    """
-    A response listener that resolves a single future exactly once.
-    """
-
-    future: asyncio.Future = dataclasses.field(
-        default_factory=lambda: asyncio.get_running_loop().create_future()
-    )
-
-    def _resolve(self, response: t.CommandBase) -> bool:
-        if self.future.done():
-            # This happens if the UART receives multiple packets during the same
-            # event loop step and all of them match this listener. Our Future's
-            # add_done_callback will not fire synchronously and thus the listener
-            # is never properly removed. This isn't going to break anything.
-            LOGGER.debug("Future already has a result set: %s", self.future)
-            return False
-
-        self.future.set_result(response)
-        return True
-
-    def cancel(self):
-        if not self.future.done():
-            self.future.cancel()
-
-        return True
-
-
-@dataclasses.dataclass(frozen=True)
-class CallbackResponseListener(BaseResponseListener):
-    """
-    A response listener with a sync or async callback that is never resolved.
-    """
-
-    callback: typing.Callable[[t.CommandBase], typing.Any]
-
-    def _resolve(self, response: t.CommandBase) -> bool:
-        try:
-            result = self.callback(response)
-
-            # Run coroutines in the background
-            if asyncio.iscoroutine(result):
-                asyncio.create_task(result)
-        except Exception:
-            LOGGER.warning(
-                "Caught an exception while executing callback", exc_info=True
-            )
-
-        # Callbacks are always resolved
-        return True
-
-    def cancel(self):
-        # You can't cancel a callback
-        return False
+# All of these are in seconds
+AFTER_BOOTLOADER_SKIP_BYTE_DELAY = 2.5
+NETWORK_COMMISSIONING_TIMEOUT = 30
+BOOTLOADER_PIN_TOGGLE_DELAY = 0.15
+CONNECT_PING_TIMEOUT = 0.50
+CONNECT_PROBE_TIMEOUT = 10
 
 
 class ZNP:
@@ -174,18 +54,419 @@ class ZNP:
         self._listeners = defaultdict(list)
         self._sync_request_lock = asyncio.Lock()
 
-        self.capabilities = None
-        self.version = None
+        self.capabilities = None  # type: int
+        self.version = None  # type: float
 
         self.nvram = NVRAMHelper(self)
-        self.network_info: NetworkInfo = None
+        self.network_info: zigpy.state.NetworkInformation = None
+        self.node_info: zigpy.state.NodeInfo = None
 
     def set_application(self, app):
         assert self._app is None
         self._app = app
 
-    async def load_network_info(self):
-        self.network_info = await load_network_info(self)
+    async def detect_zstack_version(self) -> float:
+        """
+        Feature detects the major version of Z-Stack running on the device.
+        """
+
+        # Z-Stack 1.2 does not have the AppConfig subsystem
+        if not self.capabilities & t.MTCapabilities.APP_CNF:
+            return 1.2
+
+        try:
+            # Only Z-Stack 3.30+ has the new NVRAM system
+            await self.nvram.read(
+                item_id=ExNvIds.TCLK_TABLE,
+                sub_id=0x0000,
+                item_type=t.Bytes,
+            )
+            return 3.30
+        except KeyError:
+            return 3.30
+        except CommandNotRecognized:
+            return 3.0
+
+    async def load_network_info(self, *, load_devices=False):
+        """
+        Loads low-level network information from NVRAM.
+        Loading key data greatly increases the runtime so it not enabled by default.
+        """
+
+        from zigpy_znp.znp import security
+
+        is_on_network = None
+        nib = None
+
+        try:
+            nib = await self.nvram.osal_read(OsalNvIds.NIB, item_type=t.NIB)
+        except KeyError:
+            is_on_network = False
+        else:
+            is_on_network = nib.nwkLogicalChannel != 0 and nib.nwkKeyLoaded
+
+            if is_on_network and self.version >= 3.0:
+                # This NVRAM item is the very first thing initialized in `zgInit`
+                is_on_network = (
+                    await self.nvram.osal_read(
+                        OsalNvIds.BDBNODEISONANETWORK, item_type=t.uint8_t
+                    )
+                    == 1
+                )
+
+        if not is_on_network:
+            raise ValueError("Device is not a part of a network")
+
+        key_desc = await self.nvram.osal_read(
+            OsalNvIds.NWK_ACTIVE_KEY_INFO, item_type=t.NwkKeyDesc
+        )
+
+        tc_frame_counter = await security.read_tc_frame_counter(
+            self, ext_pan_id=nib.extendedPANID
+        )
+
+        network_info = zigpy.state.NetworkInformation(
+            extended_pan_id=nib.extendedPANID,
+            pan_id=nib.nwkPanId,
+            nwk_update_id=nib.nwkUpdateId,
+            channel=nib.nwkLogicalChannel,
+            channel_mask=nib.channelList,
+            security_level=nib.SecurityLevel,
+            network_key=zigpy.state.Key(
+                key=key_desc.Key,
+                seq=key_desc.KeySeqNum,
+                tx_counter=tc_frame_counter,
+                rx_counter=None,
+                partner_ieee=None,
+            ),
+            tc_link_key=None,
+            children=[],
+            nwk_addresses={},
+            key_table=[],
+            stack_specific=None,
+        )
+
+        tclk_seed = None
+
+        if self.version > 1.2:
+            try:
+                tclk_seed = await self.nvram.osal_read(
+                    OsalNvIds.TCLK_SEED, item_type=t.KeyData
+                )
+            except ValueError:
+                if self.version != 3.0:
+                    raise
+
+                # CC2531s that have been cross-flashed from 1.2 -> 3.0 can have NVRAM
+                # entries from both. Ignore deserialization length errors for the
+                # trailing data to allow them to be backed up.
+                tclk_seed_value = await self.nvram.osal_read(
+                    OsalNvIds.TCLK_SEED, item_type=t.Bytes
+                )
+
+                tclk_seed = self.nvram.deserialize(
+                    tclk_seed_value, t.KeyData, allow_trailing=True
+                )
+                LOGGER.error(
+                    "Your adapter's NVRAM is inconsistent! Perform a network backup,"
+                    " re-flash its firmware, and restore the backup."
+                )
+
+            network_info.stack_specific = {
+                "zstack": {
+                    "tclk_seed": tclk_seed.serialize().hex(),
+                }
+            }
+
+        # This takes a few seconds
+        if load_devices:
+            for dev in await security.read_devices(self, tclk_seed=tclk_seed):
+                if dev.node_info.nwk == 0xFFFE:
+                    dev = dev.replace(
+                        node_info=dataclasses.replace(dev.node_info, nwk=None)
+                    )
+
+                if dev.is_child:
+                    network_info.children.append(dev.node_info)
+                elif dev.node_info.nwk is not None:
+                    network_info.nwk_addresses[dev.node_info.ieee] = dev.node_info.nwk
+
+                if dev.key is not None:
+                    network_info.key_table.append(dev.key)
+
+        ieee = await self.nvram.osal_read(OsalNvIds.EXTADDR, item_type=t.EUI64)
+        logical_type = await self.nvram.osal_read(
+            OsalNvIds.LOGICAL_TYPE, item_type=t.DeviceLogicalType
+        )
+
+        node_info = zigpy.state.NodeInfo(
+            ieee=ieee,
+            nwk=nib.nwkDevAddress,
+            logical_type=zdo_t.LogicalType(logical_type),
+        )
+
+        self.network_info = network_info
+        self.node_info = node_info
+
+    async def write_network_info(
+        self,
+        *,
+        network_info: zigpy.state.NetworkInformation,
+        node_info: zigpy.state.NodeInfo,
+    ) -> None:
+        """
+        Writes network and node state to NVRAM.
+        """
+
+        from zigpy_znp.znp import security
+
+        # Delete any existing NV items that store formation state
+        await self.nvram.osal_delete(OsalNvIds.HAS_CONFIGURED_ZSTACK1)
+        await self.nvram.osal_delete(OsalNvIds.HAS_CONFIGURED_ZSTACK3)
+        await self.nvram.osal_delete(OsalNvIds.ZIGPY_ZNP_MIGRATION_ID)
+        await self.nvram.osal_delete(OsalNvIds.BDBNODEISONANETWORK)
+
+        # Instruct Z-Stack to reset everything on the next boot
+        await self.nvram.osal_write(
+            OsalNvIds.STARTUP_OPTION,
+            t.StartupOptions.ClearState | t.StartupOptions.ClearConfig,
+        )
+
+        await self.reset()
+
+        # Form a network with completely random settings to get NVRAM to a known state
+        for item, value in {
+            OsalNvIds.PANID: t.uint16_t(0xFFFF),
+            OsalNvIds.APS_USE_EXT_PANID: t.EUI64(os.urandom(8)),
+            OsalNvIds.PRECFGKEY: os.urandom(16),
+            # XXX: Z2M requires this item to be False
+            OsalNvIds.PRECFGKEYS_ENABLE: t.Bool(False),
+            # Z-Stack will scan all of thse channels during formation
+            OsalNvIds.CHANLIST: const.STARTUP_CHANNELS,
+        }.items():
+            await self.nvram.osal_write(item, value, create=True)
+
+        # Z-Stack 3+ ignores `CHANLIST`
+        if self.version > 1.2:
+            await self.request(
+                c.AppConfig.BDBSetChannel.Req(
+                    IsPrimary=True, Channel=const.STARTUP_CHANNELS
+                ),
+                RspStatus=t.Status.SUCCESS,
+            )
+            await self.request(
+                c.AppConfig.BDBSetChannel.Req(
+                    IsPrimary=False, Channel=t.Channels.NO_CHANNELS
+                ),
+                RspStatus=t.Status.SUCCESS,
+            )
+
+        # Both startup sequences end with the same callback
+        started_as_coordinator = self.wait_for_response(
+            c.ZDO.StateChangeInd.Callback(State=t.DeviceState.StartedAsCoordinator)
+        )
+
+        LOGGER.debug("Forming temporary network")
+
+        # Handle the startup progress messages
+        async with self.capture_responses(
+            [
+                c.ZDO.StateChangeInd.Callback(
+                    State=t.DeviceState.StartingAsCoordinator
+                ),
+                c.AppConfig.BDBCommissioningNotification.Callback(
+                    partial=True,
+                    Status=c.app_config.BDBCommissioningStatus.InProgress,
+                ),
+            ]
+        ):
+            try:
+                if self.version > 1.2:
+                    # Z-Stack 3 uses the BDB subsystem
+                    commissioning_rsp = await self.request_callback_rsp(
+                        request=c.AppConfig.BDBStartCommissioning.Req(
+                            Mode=c.app_config.BDBCommissioningMode.NwkFormation
+                        ),
+                        RspStatus=t.Status.SUCCESS,
+                        callback=c.AppConfig.BDBCommissioningNotification.Callback(
+                            partial=True,
+                            RemainingModes=c.app_config.BDBCommissioningMode.NONE,
+                        ),
+                        timeout=NETWORK_COMMISSIONING_TIMEOUT,
+                    )
+
+                    if (
+                        commissioning_rsp.Status
+                        != c.app_config.BDBCommissioningStatus.Success
+                    ):
+                        raise RuntimeError(
+                            f"Network formation failed: {commissioning_rsp}"
+                        )
+                else:
+                    # In Z-Stack 1.2.2, StartupFromApp actually does what it says
+                    await self.request(
+                        c.ZDO.StartupFromApp.Req(StartDelay=100),
+                        RspState=c.zdo.StartupState.NewNetworkState,
+                    )
+
+                # Both versions still end with this callback
+                await started_as_coordinator
+            except asyncio.TimeoutError as e:
+                raise RuntimeError(
+                    "Network formation refused, RF environment is likely too noisy."
+                    " Temporarily unscrew the antenna or shield the coordinator"
+                    " with metal until a network is formed."
+                ) from e
+
+        LOGGER.debug("Waiting for NIB to stabilize")
+
+        # Even though the device says it is "ready" at this point, it takes a few more
+        # seconds for `_NIB.nwkState` to switch from `NwkState.NWK_INIT`. There does
+        # not appear to be any user-facing MT command to read this information.
+        while True:
+            try:
+                nib = await self.nvram.osal_read(OsalNvIds.NIB, item_type=t.NIB)
+            except KeyError:
+                pass
+            else:
+                LOGGER.debug("Current NIB is %s", nib)
+
+                # Usually this works after the first attempt
+                if nib.nwkLogicalChannel != 0 and nib.nwkPanId != 0xFFFE:
+                    break
+
+            await asyncio.sleep(1)
+
+        await self.reset()
+
+        LOGGER.debug("Writing actual network settings")
+
+        # Now that we have a formed network, update its state
+        nib = await self.nvram.osal_read(OsalNvIds.NIB, item_type=t.NIB)
+        nib = nib.replace(
+            nwkDevAddress=node_info.nwk,
+            nwkPanId=network_info.pan_id,
+            extendedPANID=network_info.extended_pan_id,
+            nwkUpdateId=network_info.nwk_update_id,
+            nwkLogicalChannel=network_info.channel,
+            channelList=network_info.channel_mask,
+            SecurityLevel=network_info.security_level,
+            nwkManagerAddr=network_info.nwk_manager_id,
+            nwkCoordAddress=0x0000,
+        )
+
+        key_info = t.NwkActiveKeyItems(
+            Active=t.NwkKeyDesc(
+                KeySeqNum=network_info.network_key.seq,
+                Key=network_info.network_key.key,
+            ),
+            FrameCounter=network_info.network_key.tx_counter,
+        )
+
+        nvram = {
+            OsalNvIds.NIB: nib,
+            OsalNvIds.APS_USE_EXT_PANID: network_info.extended_pan_id,
+            OsalNvIds.EXTENDED_PAN_ID: network_info.extended_pan_id,
+            OsalNvIds.PRECFGKEY: key_info.Active.Key,
+            OsalNvIds.CHANLIST: network_info.channel_mask,
+            OsalNvIds.EXTADDR: node_info.ieee,
+            OsalNvIds.LOGICAL_TYPE: t.DeviceLogicalType(node_info.logical_type),
+            OsalNvIds.NWK_ACTIVE_KEY_INFO: key_info.Active,
+            OsalNvIds.NWK_ALTERN_KEY_INFO: const.EMPTY_KEY,
+        }
+
+        tclk_seed = None
+
+        if self.version > 1.2:
+            if (
+                network_info.stack_specific is not None
+                and network_info.stack_specific.get("zstack", {}).get("tclk_seed")
+            ):
+                tclk_seed, _ = t.KeyData.deserialize(
+                    bytes.fromhex(network_info.stack_specific["zstack"]["tclk_seed"])
+                )
+            else:
+                tclk_seed = t.KeyData(os.urandom(16))
+
+            nvram[OsalNvIds.TCLK_SEED] = tclk_seed
+        else:
+            nvram[OsalNvIds.TCLK_SEED] = const.DEFAULT_TC_LINK_KEY
+
+        for key, value in nvram.items():
+            await self.nvram.osal_write(key, value, create=True)
+
+        await security.write_tc_frame_counter(
+            self,
+            network_info.network_key.tx_counter,
+            ext_pan_id=network_info.extended_pan_id,
+        )
+
+        devices = {}
+
+        for child in network_info.children or []:
+            devices[child.ieee] = security.StoredDevice(
+                node_info=dataclasses.replace(
+                    child, nwk=0xFFFE if child.nwk is None else child.nwk
+                ),
+                key=None,
+                is_child=True,
+            )
+
+        for key in network_info.key_table or []:
+            device = devices.get(key.partner_ieee)
+
+            if device is None:
+                device = security.StoredDevice(
+                    node_info=zigpy.state.NodeInfo(
+                        nwk=network_info.nwk_addresses.get(key.partner_ieee, 0xFFFE),
+                        ieee=key.partner_ieee,
+                        logical_type=None,
+                    ),
+                    key=None,
+                    is_child=False,
+                )
+
+            devices[key.partner_ieee] = device.replace(key=key)
+
+        LOGGER.debug("Writing children and keys")
+
+        # Recompute the TCLK if necessary
+        if self.version > 1.2:
+            optimal_tclk_seed = security.find_optimal_tclk_seed(
+                devices.values(), tclk_seed
+            )
+
+            if tclk_seed != optimal_tclk_seed:
+                LOGGER.warning(
+                    "Provided TCLK seed %s is not optimal, using %s instead.",
+                    tclk_seed,
+                    optimal_tclk_seed,
+                )
+
+                await self.nvram.osal_write(OsalNvIds.TCLK_SEED, optimal_tclk_seed)
+                tclk_seed = optimal_tclk_seed
+
+        await security.write_devices(
+            znp=self,
+            devices=list(devices.values()),
+            tclk_seed=tclk_seed,
+            counter_increment=0,
+        )
+
+        if self.version == 1.2:
+            await self.nvram.osal_write(
+                OsalNvIds.HAS_CONFIGURED_ZSTACK1,
+                const.ZSTACK_CONFIGURE_SUCCESS,
+                create=True,
+            )
+        else:
+            await self.nvram.osal_write(
+                OsalNvIds.HAS_CONFIGURED_ZSTACK3,
+                const.ZSTACK_CONFIGURE_SUCCESS,
+                create=True,
+            )
+
+        LOGGER.debug("Done!")
 
     async def reset(self) -> None:
         """
@@ -202,6 +483,78 @@ class ZNP:
     def _port_path(self) -> str:
         return self._config[conf.CONF_DEVICE][conf.CONF_DEVICE_PATH]
 
+    @property
+    def _znp_config(self) -> conf.ConfigType:
+        return self._config[conf.CONF_ZNP_CONFIG]
+
+    async def _skip_bootloader(self) -> c.SYS.Ping.Rsp:
+        """
+        Attempt to skip the bootloader and return the ping response.
+        """
+
+        async def ping_task():
+            LOGGER.debug("Toggling RTS/DTR pins to skip bootloader or reset chip")
+
+            # The default sequence is DTR=false and RTS toggling false/true/false
+            for dtr, rts in zip(
+                self._znp_config[conf.CONF_CONNECT_DTR_STATES],
+                self._znp_config[conf.CONF_CONNECT_RTS_STATES],
+            ):
+                self._uart.set_dtr_rts(dtr=dtr, rts=rts)
+                await asyncio.sleep(BOOTLOADER_PIN_TOGGLE_DELAY)
+
+            # First, just try pinging
+            try:
+                async with async_timeout.timeout(CONNECT_PING_TIMEOUT):
+                    return await self.request(c.SYS.Ping.Req())
+            except asyncio.TimeoutError:
+                pass
+
+            # If that doesn't work, send the bootloader skip bytes and try again.
+            # Sending a bunch at a time fixes UART issues when the radio was previously
+            # probed with another library at a different baudrate.
+            LOGGER.debug("Sending CC253x bootloader skip bytes")
+            self._uart.write(256 * bytes([c.ubl.BootloaderRunMode.FORCE_RUN]))
+
+            await asyncio.sleep(AFTER_BOOTLOADER_SKIP_BYTE_DELAY)
+
+            # At this point we have nothing left to try
+            while True:
+                try:
+                    async with async_timeout.timeout(2 * CONNECT_PING_TIMEOUT):
+                        return await self.request(c.SYS.Ping.Req())
+                except asyncio.TimeoutError:
+                    pass
+
+        async with self.capture_responses([CatchAllResponse()]) as responses:
+            ping_task = asyncio.create_task(ping_task())
+
+            try:
+                async with async_timeout.timeout(CONNECT_PROBE_TIMEOUT):
+                    result = await responses.get()
+            except Exception:
+                ping_task.cancel()
+                raise
+            else:
+                LOGGER.debug("Radio is alive: %s", result)
+
+            # Give the ping task a little bit extra time to finish. Radios often queue
+            # requests so when the reset indication is received, they will all be
+            # immediately answered
+            if not ping_task.done():
+                LOGGER.debug("Giving ping task %0.2fs to finish", CONNECT_PING_TIMEOUT)
+
+                try:
+                    async with async_timeout.timeout(CONNECT_PING_TIMEOUT):
+                        result = await ping_task  # type:ignore[misc]
+                except asyncio.TimeoutError:
+                    ping_task.cancel()
+
+        if isinstance(result, c.SYS.Ping.Rsp):
+            return result
+
+        return await self.request(c.SYS.Ping.Req())
+
     async def connect(self, *, test_port=True) -> None:
         """
         Connects to the device specified by the "device" section of the config dict.
@@ -216,44 +569,15 @@ class ZNP:
         try:
             self._uart = await uart.connect(self._config[conf.CONF_DEVICE], self)
 
-            LOGGER.debug("Waiting %ss before sending anything", AFTER_CONNECT_DELAY)
-            await asyncio.sleep(AFTER_CONNECT_DELAY)
-
-            if self._config[conf.CONF_ZNP_CONFIG][conf.CONF_SKIP_BOOTLOADER]:
-                LOGGER.debug("Sending bootloader skip byte")
-
-                # XXX: Z-Stack locks up if other radios try probing it first.
-                #      Writing the bootloader skip byte a bunch of times (at least 167)
-                #      appears to reset it.
-                skip = bytes([c.ubl.BootloaderRunMode.FORCE_RUN])
-                self._uart._transport_write(skip * 256)
-
-            # We have to disable all non-bootloader commands to enter the serial
-            # bootloader upon connecting to the UART.
+            # To allow the ZNP interface to be used for bootloader commands, we have to
+            # prevent any data from being sent
             if test_port:
-                # Some Z-Stack 3 devices don't like you sending data immediately after
-                # opening the serial port. A small delay helps, but they also sometimes
-                # send a reset indication message when they're ready.
-                LOGGER.debug(
-                    "Waiting %ss or until a reset indication is received", STARTUP_DELAY
-                )
+                # The reset indication callback is sent when some sticks start up
+                self.capabilities = (await self._skip_bootloader()).Capabilities
 
-                try:
-                    async with async_timeout.timeout(STARTUP_DELAY):
-                        await self.wait_for_response(
-                            c.SYS.ResetInd.Callback(partial=True)
-                        )
-                except asyncio.TimeoutError:
-                    pass
-
-                LOGGER.debug("Testing connection to %s", self._port_path)
-
-                # Make sure that our port works
-                self.capabilities = (await self.request(c.SYS.Ping.Req())).Capabilities
-
-                # We need to know how structs are packed to deserialize frames corectly
+                # We need to know how structs are packed to deserialize frames correctly
                 await self.nvram.determine_alignment()
-                self.version = await detect_zstack_version(self)
+                self.version = await self.detect_zstack_version()
 
                 LOGGER.debug("Detected Z-Stack %s", self.version)
         except (Exception, asyncio.CancelledError):
@@ -261,17 +585,12 @@ class ZNP:
             self.close()
             raise
 
-        LOGGER.debug(
-            "Connected to %s at %s baud",
-            self._uart._transport.serial.name,
-            self._uart._transport.serial.baudrate,
-        )
+        LOGGER.debug("Connected to %s at %s baud", self._uart.name, self._uart.baudrate)
 
     def connection_made(self) -> None:
         """
         Called by the UART object when a connection has been made.
         """
-        pass
 
     def connection_lost(self, exc) -> None:
         """
@@ -293,7 +612,7 @@ class ZNP:
 
         self._app = None
 
-        for header, listeners in self._listeners.items():
+        for _header, listeners in self._listeners.items():
             for listener in listeners:
                 listener.cancel()
 
@@ -343,7 +662,7 @@ class ZNP:
             counts[OneShotResponseListener],
         )
 
-    def frame_received(self, frame: GeneralFrame) -> bool:
+    def frame_received(self, frame: GeneralFrame) -> bool | None:
         """
         Called when a frame has been received. Returns whether or not the frame was
         handled by any listener.
@@ -353,17 +672,29 @@ class ZNP:
 
         if frame.header not in c.COMMANDS_BY_ID:
             LOGGER.error("Received an unknown frame: %s", frame)
-            return
+            return None
 
         command_cls = c.COMMANDS_BY_ID[frame.header]
-        command = command_cls.from_frame(frame, align=self.nvram.align_structs)
+
+        try:
+            command = command_cls.from_frame(frame, align=self.nvram.align_structs)
+        except ValueError:
+            # Some commands can be received corrupted. They are not useful:
+            # https://github.com/home-assistant/core/issues/50005
+            if command_cls == c.ZDO.ParentAnnceRsp.Callback:
+                LOGGER.warning("Failed to parse broken %s as %s", frame, command_cls)
+                return None
+
+            raise
 
         LOGGER.debug("Received command: %s", command)
 
         matched = False
         one_shot_matched = False
 
-        for listener in self._listeners[command.header]:
+        for listener in (
+            self._listeners[command.header] + self._listeners[CatchAllResponse.header]
+        ):
             # XXX: A single response should *not* resolve multiple one-shot listeners!
             #      `future.add_done_callback` doesn't remove our listeners synchronously
             #      so doesn't prevent this from happening.
@@ -390,7 +721,7 @@ class ZNP:
         Called when a command that is not handled by any listener is received.
         """
 
-        LOGGER.warning("Received an unhandled command: %s", command)
+        LOGGER.debug("Command was not handled")
 
     @contextlib.asynccontextmanager
     async def capture_responses(self, responses):
@@ -432,7 +763,21 @@ class ZNP:
 
         return self.callback_for_responses([response], callback)
 
-    def wait_for_responses(self, responses, *, context=False) -> asyncio.Future:
+    @typing.overload
+    def wait_for_responses(
+        self, responses, *, context: typing_extensions.Literal[False] = ...
+    ) -> asyncio.Future:
+        ...
+
+    @typing.overload
+    def wait_for_responses(
+        self, responses, *, context: typing_extensions.Literal[True]
+    ) -> tuple[asyncio.Future, OneShotResponseListener]:
+        ...
+
+    def wait_for_responses(
+        self, responses, *, context: bool = False
+    ) -> asyncio.Future | tuple[asyncio.Future, OneShotResponseListener]:
         """
         Creates a one-shot listener that matches any *one* of the given responses.
         """
@@ -459,7 +804,9 @@ class ZNP:
 
         return self.wait_for_responses([response])
 
-    async def request(self, request: t.CommandBase, **response_params) -> t.CommandBase:
+    async def request(
+        self, request: t.CommandBase, **response_params
+    ) -> t.CommandBase | None:
         """
         Sends a SREQ/AREQ request and returns its SRSP (only for SREQ), failing if any
         of the SRSP's parameters don't match `response_params`.
@@ -469,7 +816,7 @@ class ZNP:
         if type(request) is not request.Req:
             raise ValueError(f"Cannot send a command that isn't a request: {request!r}")
 
-        # Construct a partial response out of the `Rsp*` kwargs if one is provded
+        # Construct a partial response out of the `Rsp*` kwargs if one is provided
         if request.Rsp:
             renamed_response_params = {}
 
@@ -499,7 +846,7 @@ class ZNP:
             if not request.Rsp:
                 LOGGER.debug("Request has no response, not waiting for one.")
                 self._uart.send(frame)
-                return
+                return None
 
             # We need to create the response listener before we send the request
             response_future = self.wait_for_responses(
@@ -514,9 +861,7 @@ class ZNP:
             self._uart.send(frame)
 
             # We should get a SRSP in a reasonable amount of time
-            async with async_timeout.timeout(
-                self._config[conf.CONF_ZNP_CONFIG][conf.CONF_SREQ_TIMEOUT]
-            ):
+            async with async_timeout.timeout(self._znp_config[conf.CONF_SREQ_TIMEOUT]):
                 # We lock until either a sync response is seen or an error occurs
                 response = await response_future
 
@@ -549,10 +894,11 @@ class ZNP:
 
         # Every request should have a timeout to prevent deadlocks
         if timeout is None:
-            timeout = self._config[conf.CONF_ZNP_CONFIG][conf.CONF_ARSP_TIMEOUT]
+            timeout = self._znp_config[conf.CONF_ARSP_TIMEOUT]
 
         callback_rsp, listener = self.wait_for_responses([callback], context=True)
 
+        # Typical request/response/callbacks are not backgrounded
         if not background:
             try:
                 async with async_timeout.timeout(timeout):
@@ -562,26 +908,28 @@ class ZNP:
             finally:
                 self.remove_listener(listener)
 
-        start_time = time.time()
+        # Backgrounded callback handlers need to respect the provided timeout
+        start_time = time.monotonic()
 
-        # If the SREQ/SRSP pair fails, we must cancel the AREQ listener
         try:
             async with async_timeout.timeout(timeout):
                 request_rsp = await self.request(request, **response_params)
         except Exception:
+            # If the SREQ/SRSP pair fails, we must cancel the AREQ listener
             self.remove_listener(listener)
             raise
 
-        async def callback_handler(timeout):
+        # If it succeeds, create a background task to receive the AREQ but take into
+        # account the time it took to start the SREQ to ensure we do not grossly exceed
+        # the timeout
+        async def callback_catcher(timeout):
             try:
                 async with async_timeout.timeout(timeout):
                     await callback_rsp
             finally:
                 self.remove_listener(listener)
 
-        # If it succeeds, create a background task to receive the AREQ but take into
-        # account the time it took to start the SREQ to ensure we do not grossly exceed
-        # the timeout
-        asyncio.create_task(callback_handler(time.time() - start_time))
+        callback_timeout = max(0, timeout - (time.monotonic() - start_time))
+        asyncio.create_task(callback_catcher(callback_timeout))
 
         return request_rsp

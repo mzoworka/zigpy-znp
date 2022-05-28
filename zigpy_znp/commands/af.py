@@ -12,7 +12,7 @@ class TransmitOptions(t.enum_flag_uint8):
     LIMIT_CONCENTRATOR = 0x08
     ACK_REQUEST = 0x10
 
-    # Suppress Route Discovery for intermediate routes (route discovery preformed for
+    # Suppress Route Discovery for intermediate routes (route discovery performed for
     # initiating device)
     SUPPRESS_ROUTE_DISC_NETWORK = 0x20
     ENABLE_SECURITY = 0x40
@@ -317,6 +317,11 @@ class AF(t.CommandsBase, subsystem=t.Subsystem.AF):
             t.Param("TimeStamp", t.uint32_t, "The timestamp of the message"),
             t.Param("TSN", t.uint8_t, "Transaction Sequence Number"),
             t.Param("Data", t.LongBytes, "Data"),
+            # https://e2e.ti.com/support/wireless-connectivity/zigbee-and-thread/f/158/t/455787
+            t.Param("MacSrcAddr", t.NWK, "UNDOCUMENTED: MAC Source address"),
+            t.Param(
+                "MsgResultRadius", t.uint8_t, "UNDOCUMENTED: Messages result radius"
+            ),
         ),
     )
 

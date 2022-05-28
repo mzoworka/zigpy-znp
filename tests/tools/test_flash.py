@@ -9,11 +9,8 @@ from zigpy_znp.tools.flash_write import main as flash_write, get_firmware_crcs
 
 from ..conftest import BaseServerZNP, CoroutineMock
 
-pytestmark = [pytest.mark.asyncio]
-
-
 random.seed(12345)
-FAKE_IMAGE_SIZE = 2 ** 10
+FAKE_IMAGE_SIZE = 2**10
 FAKE_FLASH = bytearray(
     random.getrandbits(FAKE_IMAGE_SIZE * 8).to_bytes(FAKE_IMAGE_SIZE, "little")
 )
@@ -131,3 +128,23 @@ async def test_flash_write_bad_crc(make_znp_server, tmp_path, mocker):
         await flash_write([znp_server._port_path, "-i", str(firmware_file)])
 
     assert "Firmware CRC is incorrect" in str(e)
+
+
+async def test_flash_write_bad_size(make_znp_server, tmp_path, mocker):
+    znp_server = make_znp_server(server_cls=BaseServerZNP)
+
+    # It takes too long otherwise
+    mocker.patch("zigpy_znp.commands.ubl.IMAGE_SIZE", FAKE_IMAGE_SIZE)
+
+    # Add an extra byte
+    BAD_FIRMWARE = bytearray(len(FAKE_FLASH))
+    BAD_FIRMWARE += b"\xFF"
+
+    # No communication will happen because the CRC will be invalid
+    firmware_file = tmp_path / "bad-firmware.bin"
+    firmware_file.write_bytes(BAD_FIRMWARE)
+
+    with pytest.raises(ValueError) as e:
+        await flash_write([znp_server._port_path, "-i", str(firmware_file)])
+
+    assert "Firmware is the wrong size" in str(e)

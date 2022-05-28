@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import sys
 import typing
 import logging
@@ -21,52 +23,7 @@ from . import basic
 
 LOGGER = logging.getLogger(__name__)
 
-
-class ADCChannel(basic.enum_uint8):
-    """The ADC channel."""
-
-    AIN0 = 0x00
-    AIN1 = 0x01
-    AIN2 = 0x02
-    AIN3 = 0x03
-    AIN4 = 0x04
-    AIN5 = 0x05
-    AIN6 = 0x06
-    AIN7 = 0x07
-    Temperature = 0x0E
-    Voltage = 0x0F
-
-
-class ADCResolution(basic.enum_uint8):
-    """Resolution of the ADC channel."""
-
-    bits_8 = 0x00
-    bits_10 = 0x01
-    bits_12 = 0x02
-    bits_14 = 0x03
-
-
-class GpioOperation(basic.enum_uint8):
-    """Specifies the type of operation to perform on the GPIO pins."""
-
-    SetDirection = 0x00
-    SetInputMode = 0x01
-    Set = 0x02
-    Clear = 0x03
-    Toggle = 0x04
-    Read = 0x05
-
-
-class StackTuneOperation(basic.enum_uint8):
-    """The tuning operation to be executed."""
-
-    # XXX: [Value] should correspond to the valid values specified by the
-    # ZMacTransmitPower_t enumeration (0xFD - 0x16)
-    PowerLevel = 0x00
-
-    # Set RxOnWhenIdle off/on if the value of Value is 0/1;
-    # otherwise return the 0x01 current setting of RxOnWhenIdle.
-    SetRxOnWhenIdle = 0x01
+JSONType = typing.Union[typing.Dict[str, typing.Any], typing.List[typing.Any]]
 
 
 class AddrMode(basic.enum_uint8):
@@ -107,7 +64,7 @@ class AddrModeAddress:
         }[self.mode]
 
     @classmethod
-    def deserialize(cls, data: bytes) -> "AddrModeAddress":
+    def deserialize(cls, data: bytes) -> tuple[AddrModeAddress, bytes]:
         mode, data = AddrMode.deserialize(data)
         address, data = EUI64.deserialize(data)
 
@@ -137,9 +94,7 @@ class AddrModeAddress:
 
 
 class GroupId(basic.uint16_t, hex_repr=True):
-    """"Group ID class"""
-
-    pass
+    """Group ID class"""
 
 
 class ScanType(basic.enum_uint8):
@@ -154,7 +109,7 @@ class Param:
     """Schema parameter"""
 
     name: str
-    type: typing.Any = None
+    type: type = None
     description: str = ""
     optional: bool = False
 
@@ -437,3 +392,9 @@ class ClusterIdList(basic.LVList, item_type=ClusterId, length_type=basic.uint8_t
 
 class NWKList(basic.LVList, item_type=NWK, length_type=basic.uint8_t):
     pass
+
+
+class NwkMode(basic.enum_uint8):
+    Star = 0
+    Tree = 1
+    Mesh = 2

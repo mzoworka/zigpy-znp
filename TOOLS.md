@@ -2,30 +2,70 @@
 The command line tools bundled with zigpy-znp do not depend in any way on Home Assistant
 and will work with any Texas Instruments radio previously used with ZHA or Zigbee2MQTT.
 
-# Installation
-## A note about Home Assistant
-While zigpy-znp is already installed within the Python environment used by Home Assistant
-with ZHA, getting exclusive access to the radio's serial port and shell access within the
-Docker container is not always simple. For this reason, the following installation
-instructions will help you setup just zigpy-znp on another computer. Feel free to skip
-them if you know your way around the Home Assistant OS Docker container.
 
-## Installing Python 3.7 or above
-### Linux
+# Table of Contents
+- [Installation](#installation)
+  * [In Home Assistant OS](#in-home-assistant-os)
+  * [In other environments](#in-other-environments)
+    + [Installing Python 3.7 or above](#installing-python-37-or-above)
+      - [Linux](#linux)
+      - [macOS](#macos)
+      - [Windows](#windows)
+    + [Creating a virtualenv (recommended)](#creating-a-virtualenv-recommended)
+    + [Installing zigpy-znp](#installing-zigpy-znp)
+- [Tools](#tools)
+  * [Backup and restore](#backup-and-restore)
+    + [Network backup](#network-backup)
+    + [NVRAM backup](#nvram-backup)
+  * [NVRAM reset](#nvram-reset)
+  * [Network formation](#network-formation)
+  * [Network scan](#network-scan)
+  * [Energy scan](#energy-scan)
+  * [CC2531 tools](#cc2531-tools)
+    + [Network migration for coordinator upgrades](#network-migration-for-coordinator-upgrades)
+    + [Flash operations](#flash-operations)
+      - [Flash read](#flash-read)
+      - [Flash write](#flash-write)
+
+
+# Installation
+## In Home Assistant OS
+zigpy-znp is already installed by Home Assistant's ZHA component and is used to communicate
+with your radio. You only need to gain access to the correct Docker container and temporarily
+disable ZHA to run any of the tools:
+
+1. Install [community "SSH & Web Terminal" addon](https://github.com/hassio-addons/addon-ssh/blob/main/ssh/DOCS.md) (not the official "Terminal & SSH" addon!) and configure your credentials. Note: the addon will fail to start if you use an insecure password so it's better to configure it with public key authentication.
+2. Disable "Protection mode" in the addon's configuration.
+3. At the shell, log into the main Home Assistant Docker container:
+    ```bash
+    docker exec -it homeassistant bash
+    ```
+
+4. Since ZHA is still using your Zigbee radio, you must temporarily *disable* the ZHA
+   integration before continuing. This is done with the three-dot dropdown menu in the
+   "Integrations" section of the Home Assistant web UI.
+
+## In other environments
+### Installing Python 3.7 or above
+#### Linux
 For Ubuntu 20.04:
 
 ```console
-$ sudo apt install python3 python3-virtulenv  # ensure this is Python 3.7 or above
+$ sudo apt install python3 python3-virtualenv  # ensure this is Python 3.7 or above
 ```
 
-### macOS
+#### macOS
 [Homebrew](https://brew.sh/) allows easy installation of recent Python releases.
 
 ```console
 $ brew install python@3
 ```
+If you want to use virtualenv (see below), install it as well
+```console
+$ brew install virtualenv
+```
 
-### Windows
+#### Windows
 Download the latest release of Python 3 from the [Python homepage](https://www.python.org/downloads/).
 
 If you are using a zzh! or any other device with a CH340 USB-serial adapter, you may have
@@ -49,7 +89,7 @@ Run this:
 > py -3 -m zigpy_znp.tools.foo
 ```
 
-## Creating a virtualenv (recommended)
+### Creating a virtualenv (recommended)
 It is recommended you install Python packages within a virtualenv to prevent dependency
 conflicts. You will need to activate the virtualenv again if you close your terminal
 emulator.
@@ -69,7 +109,7 @@ For Windows:
 > venv\Scripts\activate.bat  # for cmd.exe
 ```
 
-## Installing zigpy-znp
+### Installing zigpy-znp
 The latest stable release from the PyPI
 ```console
 $ pip install zigpy-znp
@@ -101,7 +141,8 @@ Firmware upgrades usually erase network settings so **you should perform a backu
 upgrading**. Currently there are two formats: a high-level backup format independent of
 zigpy-znp, and a complete low-level NVRAM backup of the device.
 
-### Network backup (beta)
+<span id="network-backup-beta"></span> <!-- so old links still work -->
+### Network backup
 A high-level and stack-agnostic backup of your device's network data using the
 [Open Coordinator Backup Format](https://github.com/zigpy/open-coordinator-backup/)
 allows you to snapshot the device state and move your network between any supported
@@ -115,28 +156,29 @@ $ python -m zigpy_znp.tools.network_restore /dev/serial/by-id/new_radio -i netwo
 For example, a network backup will allow you to migrate from a CC2531 with Z-Stack Home
 1.2 to a zzh! without re-joining any devices. The backup format is human-readable and 
 fully documented so you can fill out the appropriate information by hand to form a network
-if you are migrating from a non-Texas Instruments device.
+if you are migrating from a coordinator that isn't currently supported.
 
-*Note: network backups are a recent addition and while they have been tested on numerous
-devices with various network configurations, they use low-level operations and may have
-bugs.*
+To get ZHA to utilize your new radio, either:
+ 1. Remove and re-add the ZHA integration. Your existing entities will not disappear.
+ 2. Directly edit `/config/.storage/core.config_entries`, update the coordinator's
+    `path`, and change the `baudrate` to `115200`.
 
 ### NVRAM backup
 In contrast to the high-level coordinator backup described above, an exhaustive, low-level
 NVRAM backup can be performed to clone your entire device state. The backed up data is
-opaque and contains little human-readable information:
+opaque and contains little human-readable information.
+
+Note: the NVRAM structure is device- and firmware-specific so **an NVRAM backup can only be
+restored to a device similar to the original**:
+
+ - CC2531 with Z-Stack Home 1.2 is **only** compatible with another CC2531 running Z-Stack Home 1.2.
+ - CC2531 with Z-Stack 3.0 is **only** compatible with another CC2531 running Z-Stack 3.0.
+ - Newer chips like the CC2652R/RB and the CC1352P (zzh!, Slaesh's stick, and the LAUNCHXL boards) **are all cross-compatible**.
 
 ```console
 $ python -m zigpy_znp.tools.nvram_read /dev/serial/by-id/old_radio -o backup.json
 $ python -m zigpy_znp.tools.nvram_write /dev/serial/by-id/new_radio -i backup.json
 ```
-
-Note: the NVRAM structure is device- and firmware-specific so an NVRAM backup can only be
-restored to a device similar to the original:
-
- - CC2531 with Z-Stack Home 1.2 is only compatible with another CC2531 running Z-Stack Home 1.2.
- - CC2531 with Z-Stack 3.0 is only compatible with another CC2531 running Z-Stack 3.0.
- - Newer chips like the CC2652R/RB and the CC1352P (zzh!, Slaesh's stick, and the LAUNCHXL boards) are all cross-compatible.
 
 ## NVRAM reset
 Erase your device's NVRAM entries to fully reset it:
@@ -213,7 +255,7 @@ button closest to the antenna (the LED will turn red), or running one of the fol
 commands:
 
 #### Flash read
-This read only the firmware. NVRAM regions are not accessible from the serial bootloader.
+This reads only the firmware. NVRAM regions are not accessible from the serial bootloader.
 
 ```console
 $ python -m zigpy_znp.tools.flash_read -o firmware.bin /dev/cu.usbmodem14101

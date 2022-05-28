@@ -1,4 +1,5 @@
 import json
+import logging
 
 import pytest
 
@@ -9,9 +10,7 @@ from zigpy_znp.tools.nvram_read import main as nvram_read
 from zigpy_znp.tools.nvram_reset import main as nvram_reset
 from zigpy_znp.tools.nvram_write import main as nvram_write
 
-from ..conftest import ALL_DEVICES, BaseZStack1CC2531
-
-pytestmark = [pytest.mark.asyncio]
+from ..conftest import ALL_DEVICES, BaseZStack1CC2531, FormedLaunchpadCC26X2R1
 
 
 def dump_nvram(znp):
@@ -78,7 +77,7 @@ async def test_nvram_read(device, make_znp_server, tmp_path, mocker):
 async def test_nvram_write(device, make_znp_server, tmp_path, mocker):
     znp_server = make_znp_server(server_cls=device)
 
-    # Prevent the reset from occuring so NVRAM state isn't affected during "startup"
+    # Prevent the reset from occurring so NVRAM state isn't affected during "startup"
     version = znp_server.version_replier(None)
     znp_server.reply_to(
         c.SYS.ResetReq.Req(partial=True),
@@ -116,11 +115,6 @@ async def test_nvram_write(device, make_znp_server, tmp_path, mocker):
     # This already exists
     znp_server._nvram[ExNvIds.LEGACY][OsalNvIds.HAS_CONFIGURED_ZSTACK3] = b"\xBB"
 
-    # XXX: empty NVRAM breaks current alignment autodetection method (NWKKEY is missing)
-    async def replacement(self, *args, **kwargs):
-        self.align_structs = znp_server.align_structs
-
-    mocker.patch("zigpy_znp.nvram.NVRAMHelper.determine_alignment", new=replacement)
     await nvram_write([znp_server._port_path, "-i", str(backup_file)])
 
     nvram_obj = dump_nvram(znp_server)
@@ -135,11 +129,28 @@ async def test_nvram_write(device, make_znp_server, tmp_path, mocker):
 
 
 @pytest.mark.parametrize("device", ALL_DEVICES)
-async def test_nvram_reset(device, make_znp_server, mocker):
+async def test_nvram_reset(device, make_znp_server):
     znp_server = make_znp_server(server_cls=device)
     znp_server._nvram[ExNvIds.LEGACY][OsalNvIds.STARTUP_OPTION] = b"\xFF"
 
     await nvram_reset([znp_server._port_path])
+
+    # Nothing exists but the synthetic POLL_RATE_OLD16
+    assert len(znp_server._nvram[ExNvIds.LEGACY].keys()) == 1
+    assert len([v for v in znp_server._nvram.values() if v]) == 1
+    assert OsalNvIds.POLL_RATE_OLD16 in znp_server._nvram[ExNvIds.LEGACY]
+
+    znp_server.close()
+
+
+@pytest.mark.parametrize("device", [FormedLaunchpadCC26X2R1])
+async def test_nvram_reset_clear(device, make_znp_server, caplog):
+    znp_server = make_znp_server(server_cls=device)
+
+    with caplog.at_level(logging.WARNING):
+        await nvram_reset(["-c", znp_server._port_path])
+
+    assert "will be removed in a future release" in caplog.text
 
     # Nothing exists but the synthetic POLL_RATE_OLD16
     assert len(znp_server._nvram[ExNvIds.LEGACY].keys()) == 1

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import typing
 import logging
 import argparse
@@ -7,6 +8,7 @@ import argparse
 import jsonschema
 import coloredlogs
 
+import zigpy_znp.types as t
 import zigpy_znp.logger as log
 
 LOG_LEVELS = [logging.INFO, logging.DEBUG, log._TRACE]
@@ -34,7 +36,7 @@ OPEN_COORDINATOR_BACKUP_SCHEMA = {
                 "zstack": {
                     "type": "object",
                     "properties": {
-                        "tclk_seed": {"type": "string", "pattern": "[a-fA-F0-9]{32}"}
+                        "tclk_seed": {"type": "string", "pattern": "[a-fA-F0-9]{32}"},
                     },
                 }
             },
@@ -67,8 +69,12 @@ OPEN_COORDINATOR_BACKUP_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "nwk_address": {"type": "string", "pattern": "[a-fA-F0-9]{4}"},
+                    "nwk_address": {
+                        "type": ["string", "null"],
+                        "pattern": "[a-fA-F0-9]{4}",
+                    },
                     "ieee_address": {"type": "string", "pattern": "[a-fA-F0-9]{16}"},
+                    "is_child": {"type": "boolean"},
                     "link_key": {
                         "type": "object",
                         "properties": {
@@ -106,12 +112,12 @@ OPEN_COORDINATOR_BACKUP_SCHEMA = {
 }
 
 
-def validate_backup_json(backup: dict[str, typing.Any]) -> None:
+def validate_backup_json(backup: t.JSONType) -> None:
     jsonschema.validate(backup, schema=OPEN_COORDINATOR_BACKUP_SCHEMA)
 
 
 class CustomArgumentParser(argparse.ArgumentParser):
-    def parse_args(self, args: list[str] = None, namespace=None):
+    def parse_args(self, args: typing.Sequence[str] | None = None, namespace=None):
         args = super().parse_args(args, namespace)
 
         # Since we're running as a CLI tool, install our own log level and color logger
@@ -140,6 +146,41 @@ class CustomArgumentParser(argparse.ArgumentParser):
         )
 
         return args
+
+
+class UnclosableFile:
+    """
+    Wraps a file object so that every operation but "close" is proxied.
+    """
+
+    def __init__(self, f):
+        self.f = f
+
+    def close(self):
+        return
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return
+
+    def __getattr__(self, name):
+        return getattr(self.f, name)
+
+
+class ClosableFileType(argparse.FileType):
+    """
+    Allows `FileType` to always be closed properly, even with stdout and stdin.
+    """
+
+    def __call__(self, string):
+        f = super().__call__(string)
+
+        if f not in (sys.stdin, sys.stdout):
+            return f
+
+        return UnclosableFile(f)
 
 
 def setup_parser(description: str) -> argparse.ArgumentParser:

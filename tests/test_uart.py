@@ -218,10 +218,9 @@ def test_uart_frame_received_error(connected_uart, mocker):
     uart.data_received(test_frame_bytes * 3)
 
     # We should have received all three frames
-    znp.frame_received.call_count == 3
+    assert znp.frame_received.call_count == 3
 
 
-@pytest.mark.asyncio
 async def test_connection_lost(dummy_serial_conn, mocker, event_loop):
     device, _ = dummy_serial_conn
 
@@ -230,7 +229,7 @@ async def test_connection_lost(dummy_serial_conn, mocker, event_loop):
     znp.connection_lost = conn_lost_fut.set_result
 
     protocol = await znp_uart.connect(
-        conf.SCHEMA_DEVICE({conf.CONF_DEVICE_PATH: device}), api=znp, toggle_rts=False
+        conf.SCHEMA_DEVICE({conf.CONF_DEVICE_PATH: device}), api=znp
     )
 
     exception = RuntimeError("Uh oh, something broke")
@@ -240,55 +239,10 @@ async def test_connection_lost(dummy_serial_conn, mocker, event_loop):
     assert (await conn_lost_fut) == exception
 
 
-@pytest.mark.asyncio
 async def test_connection_made(dummy_serial_conn, mocker):
     device, _ = dummy_serial_conn
     znp = mocker.Mock()
 
-    await znp_uart.connect(
-        conf.SCHEMA_DEVICE({conf.CONF_DEVICE_PATH: device}), api=znp, toggle_rts=False
-    )
+    await znp_uart.connect(conf.SCHEMA_DEVICE({conf.CONF_DEVICE_PATH: device}), api=znp)
 
     znp.connection_made.assert_called_once_with()
-
-
-@pytest.mark.asyncio
-async def test_no_toggle_rts(dummy_serial_conn, mocker):
-    device, serial = dummy_serial_conn
-
-    type(serial).dtr = dtr = mocker.PropertyMock()
-    type(serial).rts = rts = mocker.PropertyMock()
-
-    znp = mocker.Mock()
-
-    await znp_uart.connect(
-        conf.SCHEMA_DEVICE({conf.CONF_DEVICE_PATH: device}), api=znp, toggle_rts=False
-    )
-
-    assert dtr.mock_calls == []
-    assert rts.mock_calls == []
-
-
-@pytest.mark.asyncio
-async def test_toggle_rts(dummy_serial_conn, mocker):
-    device, serial = dummy_serial_conn
-
-    type(serial).dtr = dtr = mocker.PropertyMock()
-    type(serial).rts = rts = mocker.PropertyMock()
-
-    znp = mocker.Mock()
-
-    await znp_uart.connect(
-        conf.SCHEMA_DEVICE({conf.CONF_DEVICE_PATH: device}), api=znp, toggle_rts=True
-    )
-
-    assert dtr.mock_calls == [
-        mocker.call(False),
-        mocker.call(False),
-        mocker.call(False),
-    ]
-    assert rts.mock_calls == [
-        mocker.call(False),
-        mocker.call(True),
-        mocker.call(False),
-    ]

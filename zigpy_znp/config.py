@@ -48,6 +48,33 @@ def EnumValue(enum, transformer=str):
     return validator
 
 
+def keys_have_same_length(*keys):
+    def validator(config):
+        lengths = [len(config[k]) for k in keys]
+
+        if len(set(lengths)) != 1:
+            raise vol.Invalid(
+                f"Values for {keys} must all have the same length: {lengths}"
+            )
+
+        return config
+
+    return validator
+
+
+def bool_to_upper_str(value: typing.Any) -> str:
+    """
+    Converts the value into an uppercase string, including unquoted YAML booleans.
+    """
+
+    if value is True:
+        return "ON"
+    elif value is False:
+        return "OFF"
+    else:
+        return str(value).upper()
+
+
 CONF_ZNP_CONFIG = "znp_config"
 CONF_TX_POWER = "tx_power"
 CONF_LED_MODE = "led_mode"
@@ -56,28 +83,39 @@ CONF_SREQ_TIMEOUT = "sync_request_timeout"
 CONF_ARSP_TIMEOUT = "async_response_timeout"
 CONF_AUTO_RECONNECT_RETRY_DELAY = "auto_reconnect_retry_delay"
 CONF_MAX_CONCURRENT_REQUESTS = "max_concurrent_requests"
+CONF_CONNECT_RTS_STATES = "connect_rts_pin_states"
+CONF_CONNECT_DTR_STATES = "connect_dtr_pin_states"
 
 CONFIG_SCHEMA = CONFIG_SCHEMA.extend(
     {
         vol.Required(CONF_DEVICE): SCHEMA_DEVICE,
         vol.Optional(CONF_ZNP_CONFIG, default={}): vol.Schema(
-            {
-                vol.Optional(CONF_TX_POWER, default=None): vol.Any(
-                    None, vol.All(int, vol.Range(min=-22, max=19))
-                ),
-                vol.Optional(CONF_SREQ_TIMEOUT, default=15): VolPositiveNumber,
-                vol.Optional(CONF_ARSP_TIMEOUT, default=30): VolPositiveNumber,
-                vol.Optional(
-                    CONF_AUTO_RECONNECT_RETRY_DELAY, default=5
-                ): VolPositiveNumber,
-                vol.Optional(CONF_SKIP_BOOTLOADER, default=True): cv_boolean,
-                vol.Optional(CONF_LED_MODE, default=LEDMode.OFF): vol.Any(
-                    None, EnumValue(LEDMode, lambda v: str(v).upper())
-                ),
-                vol.Optional(CONF_MAX_CONCURRENT_REQUESTS, default="auto"): vol.Any(
-                    "auto", VolPositiveNumber
-                ),
-            }
+            vol.All(
+                {
+                    vol.Optional(CONF_TX_POWER, default=None): vol.Any(
+                        None, vol.All(int, vol.Range(min=-22, max=22))
+                    ),
+                    vol.Optional(CONF_SREQ_TIMEOUT, default=15): VolPositiveNumber,
+                    vol.Optional(CONF_ARSP_TIMEOUT, default=30): VolPositiveNumber,
+                    vol.Optional(
+                        CONF_AUTO_RECONNECT_RETRY_DELAY, default=5
+                    ): VolPositiveNumber,
+                    vol.Optional(CONF_SKIP_BOOTLOADER, default=True): cv_boolean,
+                    vol.Optional(CONF_LED_MODE, default=LEDMode.OFF): vol.Any(
+                        None, EnumValue(LEDMode, transformer=bool_to_upper_str)
+                    ),
+                    vol.Optional(CONF_MAX_CONCURRENT_REQUESTS, default="auto"): vol.Any(
+                        "auto", VolPositiveNumber
+                    ),
+                    vol.Optional(
+                        CONF_CONNECT_RTS_STATES, default=[False, True, False]
+                    ): vol.Schema([cv_boolean]),
+                    vol.Optional(
+                        CONF_CONNECT_DTR_STATES, default=[False, False, False]
+                    ): vol.Schema([cv_boolean]),
+                },
+                keys_have_same_length(CONF_CONNECT_RTS_STATES, CONF_CONNECT_DTR_STATES),
+            )
         ),
     }
 )

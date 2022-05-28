@@ -1,8 +1,8 @@
+from __future__ import annotations
+
 import sys
-import typing
 import asyncio
 import logging
-import argparse
 
 import async_timeout
 
@@ -10,7 +10,7 @@ import zigpy_znp.types as t
 import zigpy_znp.commands as c
 from zigpy_znp.api import ZNP
 from zigpy_znp.config import CONFIG_SCHEMA
-from zigpy_znp.tools.common import setup_parser
+from zigpy_znp.tools.common import ClosableFileType, setup_parser
 from zigpy_znp.tools.nvram_reset import nvram_reset
 
 LOGGER = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ def compute_crc16(data: bytes) -> int:
     return crc
 
 
-def get_firmware_crcs(firmware: bytes) -> typing.Tuple[int, int]:
+def get_firmware_crcs(firmware: bytes) -> tuple[int, int]:
     # There is room for *two* CRCs in the firmware file: the expected and the computed
     firmware_without_crcs = (
         firmware[: c.ubl.IMAGE_CRC_OFFSET]
@@ -54,7 +54,7 @@ def get_firmware_crcs(firmware: bytes) -> typing.Tuple[int, int]:
     return real_crc, compute_crc16(firmware_without_crcs)
 
 
-async def write_firmware(firmware: bytes, radio_path: str, reset_nvram: bool):
+async def write_firmware(znp: ZNP, firmware: bytes, reset_nvram: bool):
     if len(firmware) != c.ubl.IMAGE_SIZE:
         raise ValueError(
             f"Firmware is the wrong size."
@@ -68,15 +68,6 @@ async def write_firmware(firmware: bytes, radio_path: str, reset_nvram: bool):
             f"Firmware CRC is incorrect."
             f" Expected 0x{expected_crc:04X}, got 0x{computed_crc:04X}"
         )
-
-    znp = ZNP(
-        CONFIG_SCHEMA(
-            {"znp_config": {"skip_bootloader": False}, "device": {"path": radio_path}}
-        )
-    )
-
-    # The bootloader handshake must be the very first command
-    await znp.connect(test_port=False)
 
     try:
         async with async_timeout.timeout(5):
@@ -145,15 +136,13 @@ async def write_firmware(firmware: bytes, radio_path: str, reset_nvram: bool):
     else:
         LOGGER.info("Unplug your adapter to leave bootloader mode!")
 
-    znp.close()
-
 
 async def main(argv):
     parser = setup_parser("Write firmware to a radio")
     parser.add_argument(
         "--input",
         "-i",
-        type=argparse.FileType("rb"),
+        type=ClosableFileType("rb"),
         help="Input .bin file",
         required=True,
     )
@@ -167,7 +156,21 @@ async def main(argv):
 
     args = parser.parse_args(argv)
 
-    await write_firmware(args.input.read(), args.serial, args.reset)
+    with args.input as f:
+        firmware = f.read()
+
+    znp = ZNP(
+        CONFIG_SCHEMA(
+            {"znp_config": {"skip_bootloader": False}, "device": {"path": args.serial}}
+        )
+    )
+
+    # The bootloader handshake must be the very first command
+    await znp.connect(test_port=False)
+
+    await write_firmware(znp=znp, firmware=firmware, reset_nvram=args.reset)
+
+    znp.close()
 
 
 if __name__ == "__main__":

@@ -8,8 +8,6 @@ from zigpy_znp.zigbee.application import ControllerApplication
 
 from ..conftest import FORMED_DEVICES, FormedLaunchpadCC26X2R1, swap_attribute
 
-pytestmark = [pytest.mark.asyncio]
-
 
 async def test_no_double_connect(make_znp_server, mocker):
     znp_server = make_znp_server(server_cls=FormedLaunchpadCC26X2R1)
@@ -29,7 +27,7 @@ async def test_leak_detection(make_znp_server, mocker):
     znp_server = make_znp_server(server_cls=FormedLaunchpadCC26X2R1)
 
     def count_connected():
-        return sum([t._is_connected for t in znp_server._transports])
+        return sum(t._is_connected for t in znp_server._transports)
 
     # Opening and closing one connection will keep the count at zero
     assert count_connected() == 0
@@ -60,12 +58,12 @@ async def test_probe_unsuccessful():
 
 @pytest.mark.parametrize("device", FORMED_DEVICES)
 async def test_probe_unsuccessful_slow(device, make_znp_server, mocker):
-    znp_server = make_znp_server(server_cls=device)
+    znp_server = make_znp_server(server_cls=device, shorten_delays=False)
 
     # Don't respond to anything
     znp_server._listeners.clear()
 
-    mocker.patch("zigpy_znp.zigbee.application.PROBE_TIMEOUT", new=0.1)
+    mocker.patch("zigpy_znp.api.CONNECT_PROBE_TIMEOUT", new=0.1)
 
     assert not (
         await ControllerApplication.probe(
@@ -78,7 +76,7 @@ async def test_probe_unsuccessful_slow(device, make_znp_server, mocker):
 
 @pytest.mark.parametrize("device", FORMED_DEVICES)
 async def test_probe_successful(device, make_znp_server):
-    znp_server = make_znp_server(server_cls=device)
+    znp_server = make_znp_server(server_cls=device, shorten_delays=False)
 
     assert await ControllerApplication.probe(
         conf.SCHEMA_DEVICE({conf.CONF_DEVICE_PATH: znp_server.serial_port})
@@ -89,7 +87,7 @@ async def test_probe_successful(device, make_znp_server):
 @pytest.mark.parametrize("device", FORMED_DEVICES)
 async def test_probe_multiple(device, make_znp_server):
     # Make sure that our listeners don't get cleaned up after each probe
-    znp_server = make_znp_server(server_cls=device)
+    znp_server = make_znp_server(server_cls=device, shorten_delays=False)
     znp_server.close = lambda: None
 
     config = conf.SCHEMA_DEVICE({conf.CONF_DEVICE_PATH: znp_server.serial_port})
@@ -112,6 +110,7 @@ async def test_reconnect(device, event_loop, make_application):
                 conf.CONF_SREQ_TIMEOUT: 0.1,
             }
         },
+        shorten_delays=False,
     )
 
     # Start up the server
@@ -245,13 +244,13 @@ async def test_reconnect_lockup_pyserial(device, event_loop, make_application, m
 
     did_load_info = asyncio.get_running_loop().create_future()
 
-    async def patched_load_network_info(*, old_load=app._load_network_info):
+    async def patched_load_network_info(*, old_load=app.load_network_info):
         try:
             return await old_load()
         finally:
             did_load_info.set_result(True)
 
-    with swap_attribute(app, "_load_network_info", patched_load_network_info):
+    with swap_attribute(app, "load_network_info", patched_load_network_info):
         # "Drop" the connection like PySerial
         app._znp._uart.connection_lost(exc=None)
 
