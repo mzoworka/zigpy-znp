@@ -1,0 +1,8 @@
+aiosqlite
+crccheck
+cryptography
+voluptuous
+pyserial-asyncio
+jsonschema
+coloredlogs
+git+https://github.com/mzoworka/zigpy.git@cba31144447e1ad9aa2966e07ab6aa0e169dff84
