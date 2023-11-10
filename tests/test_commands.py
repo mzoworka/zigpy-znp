@@ -68,7 +68,7 @@ def test_error_code():
 
     r, rest = t.ErrorCode.deserialize(b"\xaa" + extra)
     assert rest == extra
-    assert r.name == "unknown_0xAA"
+    assert r.name == "undefined_0xaa"
 
 
 def _validate_schema(schema):
@@ -542,4 +542,20 @@ def test_command_possibly_empty_payload():
 
     assert Test.from_frame(frames.GeneralFrame(header=Test.header, data=b"")) == Test(
         Data=t.Bytes(b"")
+    )
+
+
+def test_neighbors_missing_payload():
+    frame = frames.GeneralFrame(
+        header=t.CommandHeader(
+            id=0xB1,
+            subsystem=t.Subsystem.ZDO,
+            type=t.CommandType.AREQ,
+        ),
+        data=b"\x1F\x82\x84",
+    )
+
+    assert c.ZDO.MgmtLqiRsp.Callback.from_frame(frame) == c.ZDO.MgmtLqiRsp.Callback(
+        Src=0x821F,
+        Status=t.ZDOStatus.NOT_SUPPORTED,
     )

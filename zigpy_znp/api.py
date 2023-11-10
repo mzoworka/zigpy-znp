@@ -8,11 +8,14 @@ import logging
 import itertools
 import contextlib
 import dataclasses
+import importlib.metadata
 from collections import Counter, defaultdict
 
 import zigpy.state
 import async_timeout
 import zigpy.zdo.types as zdo_t
+import zigpy.exceptions
+from zigpy.exceptions import NetworkNotFormed
 
 import zigpy_znp.const as const
 import zigpy_znp.types as t
@@ -38,11 +41,14 @@ LOGGER = logging.getLogger(__name__)
 
 
 # All of these are in seconds
+STARTUP_TIMEOUT = 15
 AFTER_BOOTLOADER_SKIP_BYTE_DELAY = 2.5
-NETWORK_COMMISSIONING_TIMEOUT = 30
+NETWORK_COMMISSIONING_TIMEOUT = 60
 BOOTLOADER_PIN_TOGGLE_DELAY = 0.15
 CONNECT_PING_TIMEOUT = 0.50
 CONNECT_PROBE_TIMEOUT = 10
+
+NVRAM_MIGRATION_ID = 1
 
 
 class ZNP:
@@ -58,7 +64,7 @@ class ZNP:
         self.version = None  # type: float
 
         self.nvram = NVRAMHelper(self)
-        self.network_info: zigpy.state.NetworkInformation = None
+        self.network_info: zigpy.state.NetworkInfo = None
         self.node_info: zigpy.state.NodeInfo = None
 
     def set_application(self, app):
@@ -87,7 +93,7 @@ class ZNP:
         except CommandNotRecognized:
             return 3.0
 
-    async def load_network_info(self, *, load_devices=False):
+    async def _load_network_info(self, *, load_devices=False):
         """
         Loads low-level network information from NVRAM.
         Loading key data greatly increases the runtime so it not enabled by default.
@@ -95,37 +101,44 @@ class ZNP:
 
         from zigpy_znp.znp import security
 
-        is_on_network = None
-        nib = None
+        nib = await self.nvram.osal_read(OsalNvIds.NIB, item_type=t.NIB)
 
-        try:
-            nib = await self.nvram.osal_read(OsalNvIds.NIB, item_type=t.NIB)
-        except KeyError:
-            is_on_network = False
-        else:
-            is_on_network = nib.nwkLogicalChannel != 0 and nib.nwkKeyLoaded
+        if nib.nwkLogicalChannel == 0 or not nib.nwkKeyLoaded:
+            raise NetworkNotFormed()
 
-            if is_on_network and self.version >= 3.0:
-                # This NVRAM item is the very first thing initialized in `zgInit`
-                is_on_network = (
-                    await self.nvram.osal_read(
-                        OsalNvIds.BDBNODEISONANETWORK, item_type=t.uint8_t
-                    )
-                    == 1
-                )
+        # This NVRAM item is the very first thing initialized in `zgInit`
+        if (
+            self.version >= 3.0
+            and await self.nvram.osal_read(
+                OsalNvIds.BDBNODEISONANETWORK, item_type=t.uint8_t
+            )
+            != 1
+        ):
+            raise NetworkNotFormed()
 
-        if not is_on_network:
-            raise ValueError("Device is not a part of a network")
+        ieee = await self.nvram.osal_read(OsalNvIds.EXTADDR, item_type=t.EUI64)
+        logical_type = await self.nvram.osal_read(
+            OsalNvIds.LOGICAL_TYPE, item_type=t.DeviceLogicalType
+        )
+
+        node_info = zigpy.state.NodeInfo(
+            ieee=ieee,
+            nwk=nib.nwkDevAddress,
+            logical_type=zdo_t.LogicalType(logical_type),
+        )
 
         key_desc = await self.nvram.osal_read(
             OsalNvIds.NWK_ACTIVE_KEY_INFO, item_type=t.NwkKeyDesc
         )
 
-        tc_frame_counter = await security.read_tc_frame_counter(
+        nwk_frame_counter = await security.read_nwk_frame_counter(
             self, ext_pan_id=nib.extendedPANID
         )
 
-        network_info = zigpy.state.NetworkInformation(
+        version = await self.request(c.SYS.Version.Req())
+
+        network_info = zigpy.state.NetworkInfo(
+            source=f"zigpy-znp@{importlib.metadata.version('zigpy-znp')}",
             extended_pan_id=nib.extendedPANID,
             pan_id=nib.nwkPanId,
             nwk_update_id=nib.nwkUpdateId,
@@ -135,15 +148,22 @@ class ZNP:
             network_key=zigpy.state.Key(
                 key=key_desc.Key,
                 seq=key_desc.KeySeqNum,
-                tx_counter=tc_frame_counter,
-                rx_counter=None,
-                partner_ieee=None,
+                tx_counter=nwk_frame_counter,
+                rx_counter=0,
+                partner_ieee=node_info.ieee,
             ),
-            tc_link_key=None,
+            tc_link_key=zigpy.state.Key(
+                key=const.DEFAULT_TC_LINK_KEY,
+                seq=0,
+                tx_counter=0,
+                rx_counter=0,
+                partner_ieee=node_info.ieee,
+            ),
             children=[],
             nwk_addresses={},
             key_table=[],
-            stack_specific=None,
+            stack_specific={},
+            metadata={"zstack": version.as_dict()},
         )
 
         tclk_seed = None
@@ -187,86 +207,33 @@ class ZNP:
                     )
 
                 if dev.is_child:
-                    network_info.children.append(dev.node_info)
-                elif dev.node_info.nwk is not None:
+                    network_info.children.append(dev.node_info.ieee)
+
+                if dev.node_info.nwk is not None:
                     network_info.nwk_addresses[dev.node_info.ieee] = dev.node_info.nwk
 
                 if dev.key is not None:
                     network_info.key_table.append(dev.key)
 
-        ieee = await self.nvram.osal_read(OsalNvIds.EXTADDR, item_type=t.EUI64)
-        logical_type = await self.nvram.osal_read(
-            OsalNvIds.LOGICAL_TYPE, item_type=t.DeviceLogicalType
-        )
-
-        node_info = zigpy.state.NodeInfo(
-            ieee=ieee,
-            nwk=nib.nwkDevAddress,
-            logical_type=zdo_t.LogicalType(logical_type),
-        )
-
         self.network_info = network_info
         self.node_info = node_info
 
-    async def write_network_info(
-        self,
-        *,
-        network_info: zigpy.state.NetworkInformation,
-        node_info: zigpy.state.NodeInfo,
-    ) -> None:
+    async def load_network_info(self, *, load_devices=False):
         """
-        Writes network and node state to NVRAM.
+        Loads low-level network information from NVRAM.
+        Loading key data greatly increases the runtime so it not enabled by default.
         """
 
-        from zigpy_znp.znp import security
+        try:
+            await self._load_network_info(load_devices=load_devices)
+        except KeyError as e:
+            raise NetworkNotFormed() from e
 
-        # Delete any existing NV items that store formation state
-        await self.nvram.osal_delete(OsalNvIds.HAS_CONFIGURED_ZSTACK1)
-        await self.nvram.osal_delete(OsalNvIds.HAS_CONFIGURED_ZSTACK3)
-        await self.nvram.osal_delete(OsalNvIds.ZIGPY_ZNP_MIGRATION_ID)
-        await self.nvram.osal_delete(OsalNvIds.BDBNODEISONANETWORK)
-
-        # Instruct Z-Stack to reset everything on the next boot
-        await self.nvram.osal_write(
-            OsalNvIds.STARTUP_OPTION,
-            t.StartupOptions.ClearState | t.StartupOptions.ClearConfig,
-        )
-
-        await self.reset()
-
-        # Form a network with completely random settings to get NVRAM to a known state
-        for item, value in {
-            OsalNvIds.PANID: t.uint16_t(0xFFFF),
-            OsalNvIds.APS_USE_EXT_PANID: t.EUI64(os.urandom(8)),
-            OsalNvIds.PRECFGKEY: os.urandom(16),
-            # XXX: Z2M requires this item to be False
-            OsalNvIds.PRECFGKEYS_ENABLE: t.Bool(False),
-            # Z-Stack will scan all of thse channels during formation
-            OsalNvIds.CHANLIST: const.STARTUP_CHANNELS,
-        }.items():
-            await self.nvram.osal_write(item, value, create=True)
-
-        # Z-Stack 3+ ignores `CHANLIST`
-        if self.version > 1.2:
-            await self.request(
-                c.AppConfig.BDBSetChannel.Req(
-                    IsPrimary=True, Channel=const.STARTUP_CHANNELS
-                ),
-                RspStatus=t.Status.SUCCESS,
-            )
-            await self.request(
-                c.AppConfig.BDBSetChannel.Req(
-                    IsPrimary=False, Channel=t.Channels.NO_CHANNELS
-                ),
-                RspStatus=t.Status.SUCCESS,
-            )
-
+    async def start_network(self):
         # Both startup sequences end with the same callback
         started_as_coordinator = self.wait_for_response(
             c.ZDO.StateChangeInd.Callback(State=t.DeviceState.StartedAsCoordinator)
         )
-
-        LOGGER.debug("Forming temporary network")
 
         # Handle the startup progress messages
         async with self.capture_responses(
@@ -295,27 +262,37 @@ class ZNP:
                         timeout=NETWORK_COMMISSIONING_TIMEOUT,
                     )
 
-                    if (
-                        commissioning_rsp.Status
-                        != c.app_config.BDBCommissioningStatus.Success
+                    # This is the correct startup sequence according to the forums,
+                    # including the formation failure error.  Success is only returned
+                    # when the network is first formed.
+                    if commissioning_rsp.Status not in (
+                        c.app_config.BDBCommissioningStatus.FormationFailure,
+                        c.app_config.BDBCommissioningStatus.Success,
                     ):
-                        raise RuntimeError(
+                        raise zigpy.exceptions.FormationFailure(
                             f"Network formation failed: {commissioning_rsp}"
                         )
                 else:
                     # In Z-Stack 1.2.2, StartupFromApp actually does what it says
-                    await self.request(
-                        c.ZDO.StartupFromApp.Req(StartDelay=100),
-                        RspState=c.zdo.StartupState.NewNetworkState,
-                    )
+                    rsp = await self.request(c.ZDO.StartupFromApp.Req(StartDelay=100))
+
+                    if rsp.State not in (
+                        c.zdo.StartupState.NewNetworkState,
+                        c.zdo.StartupState.RestoredNetworkState,
+                    ):
+                        raise InvalidCommandResponse(
+                            f"Invalid startup response state: {rsp.State}", rsp
+                        )
 
                 # Both versions still end with this callback
-                await started_as_coordinator
+                async with async_timeout.timeout(STARTUP_TIMEOUT):
+                    await started_as_coordinator
             except asyncio.TimeoutError as e:
-                raise RuntimeError(
-                    "Network formation refused, RF environment is likely too noisy."
-                    " Temporarily unscrew the antenna or shield the coordinator"
-                    " with metal until a network is formed."
+                raise zigpy.exceptions.FormationFailure(
+                    "Network formation refused: there is too much RF interference."
+                    " Make sure your coordinator is on a USB 2.0 extension cable and"
+                    " away from any sources of interference, like USB 3.0 ports, SSDs,"
+                    " 2.4GHz routers, motherboards, etc."
                 ) from e
 
         LOGGER.debug("Waiting for NIB to stabilize")
@@ -337,7 +314,88 @@ class ZNP:
 
             await asyncio.sleep(1)
 
+    async def reset_network_info(self):
+        """
+        Resets node network information and leaves the current network.
+        """
+
+        # Delete any existing NV items that store formation state
+        await self.nvram.osal_delete(OsalNvIds.HAS_CONFIGURED_ZSTACK1)
+        await self.nvram.osal_delete(OsalNvIds.HAS_CONFIGURED_ZSTACK3)
+        await self.nvram.osal_delete(OsalNvIds.ZIGPY_ZNP_MIGRATION_ID)
+        await self.nvram.osal_delete(OsalNvIds.BDBNODEISONANETWORK)
+
+        # Instruct Z-Stack to reset everything on the next boot
+        await self.nvram.osal_write(
+            OsalNvIds.STARTUP_OPTION,
+            t.StartupOptions.ClearState | t.StartupOptions.ClearConfig,
+        )
+
         await self.reset()
+
+    async def write_network_info(
+        self,
+        *,
+        network_info: zigpy.state.NetworkInfo,
+        node_info: zigpy.state.NodeInfo,
+    ) -> None:
+        """
+        Writes network and node state to NVRAM.
+        """
+        from zigpy_znp.znp import security
+
+        try:
+            if not network_info.stack_specific.get("form_quickly", False):
+                await self.reset_network_info()
+        except InvalidCommandResponse as rsp:
+            if rsp.response.Status != t.Status.NV_OPER_FAILED:
+                raise
+
+            # Sonoff Zigbee 3.0 USB Dongle Plus coordinators randomly fail with NVRAM
+            # corruption. This seemingly can only be fixed by re-flashing the firmware.
+            raise zigpy.exceptions.FormationFailure(
+                "Network formation failed: NVRAM is corrupted, re-flash your adapter's"
+                " firmware."
+            )
+
+        # Form a network with completely random settings to get NVRAM to a known state
+        for item, value in {
+            OsalNvIds.PANID: t.uint16_t(0xFFFF),
+            OsalNvIds.APS_USE_EXT_PANID: t.EUI64(os.urandom(8)),
+            OsalNvIds.PRECFGKEY: os.urandom(16),
+            # XXX: Z2M requires this item to be False
+            OsalNvIds.PRECFGKEYS_ENABLE: t.Bool(False),
+            # Z-Stack will scan all of thse channels during formation
+            OsalNvIds.CHANLIST: const.STARTUP_CHANNELS,
+        }.items():
+            await self.nvram.osal_write(item, value, create=True)
+
+        # Z-Stack 3+ ignores `CHANLIST`
+        if self.version > 1.2:
+            await self.request(
+                c.AppConfig.BDBSetChannel.Req(
+                    IsPrimary=True, Channel=const.STARTUP_CHANNELS
+                ),
+                RspStatus=t.Status.SUCCESS,
+            )
+            await self.request(
+                c.AppConfig.BDBSetChannel.Req(
+                    IsPrimary=False, Channel=t.Channels.NO_CHANNELS
+                ),
+                RspStatus=t.Status.SUCCESS,
+            )
+
+        LOGGER.debug("Forming temporary network")
+        await self.start_network()
+        await self.reset()
+
+        if network_info.stack_specific.get("form_quickly", False):
+            await self.nvram.osal_write(
+                OsalNvIds.ZIGPY_ZNP_MIGRATION_ID,
+                t.uint8_t(NVRAM_MIGRATION_ID),
+                create=True,
+            )
+            return
 
         LOGGER.debug("Writing actual network settings")
 
@@ -369,33 +427,52 @@ class ZNP:
             OsalNvIds.EXTENDED_PAN_ID: network_info.extended_pan_id,
             OsalNvIds.PRECFGKEY: key_info.Active.Key,
             OsalNvIds.CHANLIST: network_info.channel_mask,
-            OsalNvIds.EXTADDR: node_info.ieee,
+            # If the EXTADDR entry is deleted, Z-Stack resets it to the hardware address
+            OsalNvIds.EXTADDR: (
+                None if node_info.ieee == t.EUI64.UNKNOWN else node_info.ieee
+            ),
             OsalNvIds.LOGICAL_TYPE: t.DeviceLogicalType(node_info.logical_type),
             OsalNvIds.NWK_ACTIVE_KEY_INFO: key_info.Active,
-            OsalNvIds.NWK_ALTERN_KEY_INFO: const.EMPTY_KEY,
+            OsalNvIds.NWK_ALTERN_KEY_INFO: key_info.Active,
         }
 
         tclk_seed = None
 
-        if self.version > 1.2:
+        if self.version == 1.2:
+            # TCLK_SEED is TCLK_TABLE_START in Z-Stack 1
+            nvram[OsalNvIds.TCLK_SEED] = t.TCLinkKey(
+                ExtAddr=t.EUI64.convert("FF:FF:FF:FF:FF:FF:FF:FF"),  # global
+                Key=network_info.tc_link_key.key,
+                TxFrameCounter=0,
+                RxFrameCounter=0,
+            )
+        else:
+            if network_info.tc_link_key.key != const.DEFAULT_TC_LINK_KEY:
+                LOGGER.warning(
+                    "TC link key is configured at build time in Z-Stack 3 and cannot be"
+                    " changed at runtime: %s",
+                    network_info.tc_link_key.key,
+                )
+
             if (
                 network_info.stack_specific is not None
                 and network_info.stack_specific.get("zstack", {}).get("tclk_seed")
             ):
-                tclk_seed, _ = t.KeyData.deserialize(
+                tclk_seed = t.KeyData(
                     bytes.fromhex(network_info.stack_specific["zstack"]["tclk_seed"])
                 )
             else:
                 tclk_seed = t.KeyData(os.urandom(16))
 
             nvram[OsalNvIds.TCLK_SEED] = tclk_seed
-        else:
-            nvram[OsalNvIds.TCLK_SEED] = const.DEFAULT_TC_LINK_KEY
 
         for key, value in nvram.items():
-            await self.nvram.osal_write(key, value, create=True)
+            if value is None:
+                await self.nvram.osal_delete(key)
+            else:
+                await self.nvram.osal_write(key, value, create=True)
 
-        await security.write_tc_frame_counter(
+        await security.write_nwk_frame_counter(
             self,
             network_info.network_key.tx_counter,
             ext_pan_id=network_info.extended_pan_id,
@@ -403,10 +480,12 @@ class ZNP:
 
         devices = {}
 
-        for child in network_info.children or []:
-            devices[child.ieee] = security.StoredDevice(
-                node_info=dataclasses.replace(
-                    child, nwk=0xFFFE if child.nwk is None else child.nwk
+        for ieee in network_info.children or []:
+            devices[ieee] = security.StoredDevice(
+                node_info=zigpy.state.NodeInfo(
+                    nwk=network_info.nwk_addresses.get(ieee, 0xFFFE),
+                    ieee=ieee,
+                    logical_type=zdo_t.LogicalType.EndDevice,
                 ),
                 key=None,
                 is_child=True,
@@ -453,6 +532,11 @@ class ZNP:
             counter_increment=0,
         )
 
+        # Prevent an unnecessary NVRAM migration from running
+        await self.nvram.osal_write(
+            OsalNvIds.ZIGPY_ZNP_MIGRATION_ID, t.uint8_t(NVRAM_MIGRATION_ID), create=True
+        )
+
         if self.version == 1.2:
             await self.nvram.osal_write(
                 OsalNvIds.HAS_CONFIGURED_ZSTACK1,
@@ -466,18 +550,84 @@ class ZNP:
                 create=True,
             )
 
+        # Reset after writing network settings to allow Z-Stack to recreate NVRAM items
+        # that were intentionally deleted.
+        await self.reset()
+
         LOGGER.debug("Done!")
 
-    async def reset(self) -> None:
+    async def migrate_nvram(self) -> bool:
+        """
+        Migrates NVRAM entries using the `ZIGPY_ZNP_MIGRATION_ID` NVRAM item.
+        Returns `True` if a migration was performed, `False` otherwise.
+        """
+
+        from zigpy_znp.znp import security
+
+        try:
+            migration_id = await self.nvram.osal_read(
+                OsalNvIds.ZIGPY_ZNP_MIGRATION_ID, item_type=t.uint8_t
+            )
+        except KeyError:
+            migration_id = 0
+
+        initial_migration_id = migration_id
+
+        # Migration 1: empty `ADDRMGR` entries are version-dependent and were improperly
+        #              written for CC253x devices.
+        #
+        #              This migration is stateless and can safely be run more than once:
+        #              the only downside is that startup times increase by 10s on newer
+        #              coordinators, which is why the migration ID is persisted.
+        if migration_id < 1:
+            try:
+                entries = await security.read_addr_manager_entries(self)
+            except KeyError:
+                pass
+            else:
+                fixed_entries = []
+
+                for entry in entries:
+                    if entry.extAddr != t.EUI64.convert("FF:FF:FF:FF:FF:FF:FF:FF"):
+                        fixed_entries.append(entry)
+                    elif self.version == 3.30:
+                        fixed_entries.append(const.EMPTY_ADDR_MGR_ENTRY_ZSTACK3)
+                    else:
+                        fixed_entries.append(const.EMPTY_ADDR_MGR_ENTRY_ZSTACK1)
+
+                if entries != fixed_entries:
+                    LOGGER.warning(
+                        "Repairing %d invalid empty address manager entries (total %d)",
+                        sum(i != j for i, j in zip(entries, fixed_entries)),
+                        len(entries),
+                    )
+                    await security.write_addr_manager_entries(self, fixed_entries)
+
+            migration_id = 1
+
+        if initial_migration_id == migration_id:
+            return False
+
+        await self.nvram.osal_write(
+            OsalNvIds.ZIGPY_ZNP_MIGRATION_ID, t.uint8_t(migration_id), create=True
+        )
+        await self.reset()
+
+        return True
+
+    async def reset(self, *, wait_for_reset: bool = True) -> None:
         """
         Performs a soft reset within Z-Stack.
         A hard reset resets the serial port, causing the device to disconnect.
         """
 
-        await self.request_callback_rsp(
-            request=c.SYS.ResetReq.Req(Type=t.ResetType.Soft),
-            callback=c.SYS.ResetInd.Callback(partial=True),
-        )
+        if wait_for_reset:
+            await self.request_callback_rsp(
+                request=c.SYS.ResetReq.Req(Type=t.ResetType.Soft),
+                callback=c.SYS.ResetInd.Callback(partial=True),
+            )
+        else:
+            await self.request(c.SYS.ResetReq.Req(Type=t.ResetType.Soft))
 
     @property
     def _port_path(self) -> str:
@@ -585,7 +735,7 @@ class ZNP:
             self.close()
             raise
 
-        LOGGER.debug("Connected to %s at %s baud", self._uart.name, self._uart.baudrate)
+        LOGGER.debug("Connected to %s", self._uart.url)
 
     def connection_made(self) -> None:
         """
@@ -672,7 +822,7 @@ class ZNP:
 
         if frame.header not in c.COMMANDS_BY_ID:
             LOGGER.error("Received an unknown frame: %s", frame)
-            return None
+            return False
 
         command_cls = c.COMMANDS_BY_ID[frame.header]
 
@@ -683,7 +833,7 @@ class ZNP:
             # https://github.com/home-assistant/core/issues/50005
             if command_cls == c.ZDO.ParentAnnceRsp.Callback:
                 LOGGER.warning("Failed to parse broken %s as %s", frame, command_cls)
-                return None
+                return False
 
             raise
 
@@ -805,7 +955,7 @@ class ZNP:
         return self.wait_for_responses([response])
 
     async def request(
-        self, request: t.CommandBase, **response_params
+        self, request: t.CommandBase, timeout: int | None = None, **response_params
     ) -> t.CommandBase | None:
         """
         Sends a SREQ/AREQ request and returns its SRSP (only for SREQ), failing if any
@@ -838,8 +988,18 @@ class ZNP:
 
         frame = request.to_frame(align=self.nvram.align_structs)
 
+        if self._uart is None:
+            raise RuntimeError("Coordinator is disconnected, cannot send request")
+
+        # Immediately send reset requests
+        ctx = (
+            contextlib.AsyncExitStack()
+            if isinstance(request, c.SYS.ResetReq.Req)
+            else self._sync_request_lock
+        )
+
         # We should only be sending one SREQ at a time, according to the spec
-        async with self._sync_request_lock:
+        async with ctx:
             LOGGER.debug("Sending request: %s", request)
 
             # If our request has no response, we cannot wait for one
@@ -861,7 +1021,9 @@ class ZNP:
             self._uart.send(frame)
 
             # We should get a SRSP in a reasonable amount of time
-            async with async_timeout.timeout(self._znp_config[conf.CONF_SREQ_TIMEOUT]):
+            async with async_timeout.timeout(
+                timeout or self._znp_config[conf.CONF_SREQ_TIMEOUT]
+            ):
                 # We lock until either a sync response is seen or an error occurs
                 response = await response_future
 
@@ -902,7 +1064,7 @@ class ZNP:
         if not background:
             try:
                 async with async_timeout.timeout(timeout):
-                    await self.request(request, **response_params)
+                    await self.request(request, timeout=timeout, **response_params)
 
                     return await callback_rsp
             finally:

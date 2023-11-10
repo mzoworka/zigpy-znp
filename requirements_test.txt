@@ -1,10 +1,11 @@
+pytest>=7.3.1
+pytest-asyncio>=0.21.0
+pytest-timeout>=2.1.0
+pytest-mock>=3.10.0
+pytest-cov>=4.1.0
 # Test dependencies
 
 asynctest
 coveralls
-pytest
-pytest-aiohttp
-pytest-cov
-pytest-timeout
 
 pysqlite3-binary; platform_system=="Linux"

@@ -1,18 +1,21 @@
+import gc
+import sys
 import json
+import typing
 import asyncio
 import inspect
 import logging
 import pathlib
-import contextlib
-from unittest.mock import Mock, PropertyMock
+from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
 import zigpy.types
+import zigpy.config
 import zigpy.device
 
 try:
     # Python 3.8 already has this
-    from unittest.mock import AsyncMock as CoroutineMock  # noqa: F401
+    from unittest.mock import AsyncMock as CoroutineMock  # type: ignore # noqa: F401
 except ImportError:
     from asynctest import CoroutineMock  # type:ignore[no-redef]  # noqa: F401
 
@@ -41,7 +44,46 @@ def pytest_collection_modifyitems(session, config, items):
             pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
         )
         item.add_marker(pytest.mark.filterwarnings("error::RuntimeWarning"))
-        item.add_marker(pytest.mark.asyncio)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_fixture_post_finalizer(fixturedef, request) -> None:
+    """Called after fixture teardown"""
+    if fixturedef.argname != "event_loop":
+        return
+
+    policy = asyncio.get_event_loop_policy()
+    try:
+        loop = policy.get_event_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None:
+        # Cleanup code based on the implementation of asyncio.run()
+        try:
+            if not loop.is_closed():
+                asyncio.runners._cancel_all_tasks(loop)  # type: ignore[attr-defined]
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                if sys.version_info >= (3, 9):
+                    loop.run_until_complete(loop.shutdown_default_executor())
+        finally:
+            loop.close()
+    new_loop = policy.new_event_loop()  # Replace existing event loop
+    # Ensure subsequent calls to get_event_loop() succeed
+    policy.set_event_loop(new_loop)
+
+
+@pytest.fixture
+def event_loop(
+    request: pytest.FixtureRequest,
+) -> typing.Iterator[asyncio.AbstractEventLoop]:
+    """Create an instance of the default event loop for each test case."""
+    yield asyncio.get_event_loop_policy().new_event_loop()
+    # Call the garbage collector to trigger ResourceWarning's as soon
+    # as possible (these are triggered in various __del__ methods).
+    # Without this, resources opened in one test can fail other tests
+    # when the warning is generated.
+    gc.collect()
+    # Event loop cleanup handled by pytest_fixture_post_finalizer
 
 
 class ForwardingSerialTransport:
@@ -88,11 +130,16 @@ class ForwardingSerialTransport:
 
 
 def config_for_port_path(path):
-    return conf.CONFIG_SCHEMA({conf.CONF_DEVICE: {conf.CONF_DEVICE_PATH: path}})
+    return conf.CONFIG_SCHEMA(
+        {
+            conf.CONF_DEVICE: {conf.CONF_DEVICE_PATH: path},
+            zigpy.config.CONF_NWK_BACKUP_ENABLED: False,
+        }
+    )
 
 
 @pytest.fixture
-async def make_znp_server(mocker):
+def make_znp_server(mocker):
     transports = []
 
     def inner(server_cls, config=None, shorten_delays=True):
@@ -217,20 +264,14 @@ def merge_dicts(a, b):
     return c
 
 
-@contextlib.contextmanager
-def swap_attribute(obj, name, value):
-    old_value = getattr(obj, name)
-    setattr(obj, name, value)
-
-    try:
-        yield old_value
-    finally:
-        setattr(obj, name, old_value)
-
-
 @pytest.fixture
 def make_application(make_znp_server):
-    def inner(server_cls, client_config=None, server_config=None, **kwargs):
+    def inner(
+        server_cls,
+        client_config=None,
+        server_config=None,
+        **kwargs,
+    ):
         default = config_for_port_path(FAKE_SERIAL_PORT)
 
         client_config = merge_dicts(default, client_config or {})
@@ -267,9 +308,9 @@ def make_application(make_znp_server):
 
         app.add_initialized_device = add_initialized_device.__get__(app)
 
-        return app, make_znp_server(
-            server_cls=server_cls, config=server_config, **kwargs
-        )
+        server = make_znp_server(server_cls=server_cls, config=server_config, **kwargs)
+
+        return app, server
 
     return inner
 
@@ -358,7 +399,7 @@ class BaseServerZNP(ZNP):
 
     def close(self):
         # We don't clear listeners on shutdown
-        with swap_attribute(self, "_listeners", {}):
+        with patch.object(self, "_listeners", {}):
             return super().close()
 
 
@@ -415,6 +456,7 @@ class BaseZStackDevice(BaseServerZNP):
 
         self.active_endpoints = []
         self._nvram = {}
+        self._orig_nvram = {}
 
         self.device_state = t.DeviceState.InitializedNotStarted
         self.zdo_callbacks = set()
@@ -622,6 +664,35 @@ class BaseZStackDevice(BaseServerZNP):
 
         return responses
 
+    def on_zdo_mgmt_nwk_update_req(self, req, NwkUpdate):
+        # Only handle energy scanning, for now
+        if NwkUpdate.ScanDuration in (
+            zdo_t.NwkUpdate.CHANNEL_CHANGE_REQ,
+            zdo_t.NwkUpdate.CHANNEL_MASK_MANAGER_ADDR_CHANGE_REQ,
+        ):
+            return
+
+        responses = [
+            c.ZDO.MsgCbIncoming.Callback(
+                Src=0x0000,
+                IsBroadcast=t.Bool.false,
+                ClusterId=zdo_t.ZDOCmd.Mgmt_NWK_Update_rsp,
+                SecurityUse=0,
+                TSN=req.TSN,
+                MacDst=0x0000,
+                Data=serialize_zdo_command(
+                    command_id=zdo_t.ZDOCmd.Mgmt_NWK_Update_rsp,
+                    Status=zdo_t.Status.SUCCESS,
+                    ScannedChannels=NwkUpdate.ScanChannels,
+                    TotalTransmissions=0,
+                    TransmissionFailures=0,
+                    EnergyValues=list(NwkUpdate.ScanChannels),
+                ),
+            )
+        ]
+
+        return responses
+
     def on_zdo_active_ep_req(self, req, NWKAddrOfInterest):
         if NWKAddrOfInterest != 0x0000:
             return
@@ -821,6 +892,15 @@ class BaseZStackDevice(BaseServerZNP):
                     OsalNvIds.STARTUP_OPTION
                 ] = t.StartupOptions.NONE.serialize()
 
+        # Resetting recreates the EXTADDR NVRAM item
+        if (
+            OsalNvIds.EXTADDR not in self._nvram.get(ExNvIds.LEGACY, {})
+            and self._orig_nvram
+        ):
+            self._nvram[ExNvIds.LEGACY][OsalNvIds.EXTADDR] = self._orig_nvram[
+                ExNvIds.LEGACY
+            ][OsalNvIds.EXTADDR]
+
         version = self.version_replier(None)
 
         return c.SYS.ResetInd.Callback(
@@ -854,7 +934,12 @@ class BaseZStackDevice(BaseServerZNP):
 
     @reply_to(c.ZDO.MsgCallbackRegister.Req(partial=True))
     def register_zdo_callback(self, request):
-        self.zdo_callbacks.add(request.ClusterId)
+        if request.ClusterId == 0xFFFF:
+            for cluster_id in zdo_t.ZDOCmd:
+                self.zdo_callbacks.add(cluster_id)
+        else:
+            self.zdo_callbacks.add(request.ClusterId)
+
         return c.ZDO.MsgCallbackRegister.Rsp(Status=t.Status.SUCCESS)
 
     @reply_to(c.UTIL.AssocFindDevice.Req(Index=0))
@@ -1303,43 +1388,43 @@ class BaseZStack3CC2531(BaseZStack3Device):
 class FormedLaunchpadCC26X2R1(BaseLaunchpadCC26X2R1):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
         self._nvram = load_nvram_json("CC2652R-ZStack4.formed.json")
+        self._orig_nvram = simple_deepcopy(self._nvram)
 
 
 class ResetLaunchpadCC26X2R1(BaseLaunchpadCC26X2R1):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
         self._nvram = load_nvram_json("CC2652R-ZStack4.reset.json")
+        self._orig_nvram = simple_deepcopy(self._nvram)
 
 
 class FormedZStack3CC2531(BaseZStack3CC2531):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
         self._nvram = load_nvram_json("CC2531-ZStack3.formed.json")
+        self._orig_nvram = simple_deepcopy(self._nvram)
 
 
 class ResetZStack3CC2531(BaseZStack3CC2531):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
         self._nvram = load_nvram_json("CC2531-ZStack3.reset.json")
+        self._orig_nvram = simple_deepcopy(self._nvram)
 
 
 class FormedZStack1CC2531(BaseZStack1CC2531):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
         self._nvram = load_nvram_json("CC2531-ZStack1.formed.json")
+        self._orig_nvram = simple_deepcopy(self._nvram)
 
 
 class ResetZStack1CC2531(BaseZStack1CC2531):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
         self._nvram = load_nvram_json("CC2531-ZStack1.reset.json")
+        self._orig_nvram = simple_deepcopy(self._nvram)
 
 
 EMPTY_DEVICES = [

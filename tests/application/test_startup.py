@@ -1,4 +1,6 @@
 import pytest
+import voluptuous as vol
+from zigpy.exceptions import NetworkNotFormed
 
 import zigpy_znp.types as t
 import zigpy_znp.config as conf
@@ -64,13 +66,6 @@ async def test_info(
 ):
     app, znp_server = make_application(server_cls=device)
 
-    # These should not raise any errors even if our NIB is empty
-    assert app.pan_id == 0xFFFE  # unknown NWK ID
-    assert app.extended_pan_id == t.EUI64.convert("ff:ff:ff:ff:ff:ff:ff:ff")
-    assert app.channel is None
-    assert app.channels is None
-    assert app.state.network_information.network_key is None
-
     await app.startup(auto_form=False)
 
     if network_key == t.KeyData([1, 3, 5, 7, 9, 11, 13, 15, 0, 2, 4, 6, 8, 10, 12, 13]):
@@ -78,18 +73,18 @@ async def test_info(
     else:
         assert "Your network is using the insecure" not in caplog.text
 
-    assert app.pan_id == pan_id
-    assert app.extended_pan_id == ext_pan_id
-    assert app.channel == channel
-    assert app.channels == channels
-    assert app.state.network_information.network_key.key == network_key
-    assert app.state.network_information.network_key.seq == 0
+    assert app.state.network_info.pan_id == pan_id
+    assert app.state.network_info.extended_pan_id == ext_pan_id
+    assert app.state.network_info.channel == channel
+    assert app.state.network_info.channel_mask == channels
+    assert app.state.network_info.network_key.key == network_key
+    assert app.state.network_info.network_key.seq == 0
 
-    assert app.zigpy_device.manufacturer == "Texas Instruments"
-    assert app.zigpy_device.model == model
+    assert app._device.manufacturer == "Texas Instruments"
+    assert app._device.model == model
 
     # Anything to make sure it's set
-    assert app.zigpy_device.node_desc.maximum_outgoing_transfer_size == 160
+    assert app._device.node_desc.maximum_outgoing_transfer_size == 160
 
     await app.shutdown()
 
@@ -105,8 +100,8 @@ async def test_endpoints(device, make_application):
 
     # We currently just register two endpoints
     assert len(endpoints) == 2
-    assert 1 in app.zigpy_device.endpoints
-    assert 2 in app.zigpy_device.endpoints
+    assert 1 in app._device.endpoints
+    assert 2 in app._device.endpoints
 
     await app.shutdown()
 
@@ -116,19 +111,7 @@ async def test_not_configured(device, make_application):
     app, znp_server = make_application(server_cls=device)
 
     # We cannot start the application if Z-Stack is not configured and without auto_form
-    with pytest.raises(RuntimeError):
-        await app.startup(auto_form=False)
-
-
-@pytest.mark.parametrize("device", ALL_DEVICES)
-async def test_bad_nvram_value(device, make_application):
-    app, znp_server = make_application(server_cls=device)
-
-    # An invalid value is still bad
-    znp_server._nvram[ExNvIds.LEGACY][OsalNvIds.HAS_CONFIGURED_ZSTACK3] = b"\x00"
-    znp_server._nvram[ExNvIds.LEGACY][OsalNvIds.HAS_CONFIGURED_ZSTACK1] = b"\x00"
-
-    with pytest.raises(RuntimeError):
+    with pytest.raises(NetworkNotFormed):
         await app.startup(auto_form=False)
 
 
@@ -141,21 +124,6 @@ async def test_reset(device, make_application, mocker):
     assert ZNP.reset.call_count == 0
     await app.startup()
     assert ZNP.reset.call_count >= 1
-
-    await app.shutdown()
-
-
-@pytest.mark.parametrize("device", FORMED_DEVICES)
-async def test_write_nvram(device, make_application, mocker):
-    app, znp_server = make_application(server_cls=device)
-    nvram = znp_server._nvram[ExNvIds.LEGACY]
-
-    # Change NVRAM value we should change it back
-    nvram[OsalNvIds.LOGICAL_TYPE] = t.DeviceLogicalType.EndDevice.serialize()
-
-    assert nvram[OsalNvIds.LOGICAL_TYPE] != t.DeviceLogicalType.Coordinator.serialize()
-    await app.startup()
-    assert nvram[OsalNvIds.LOGICAL_TYPE] == t.DeviceLogicalType.Coordinator.serialize()
 
     await app.shutdown()
 
@@ -253,13 +221,13 @@ async def test_auto_form_unnecessary(device, make_application, mocker):
 async def test_auto_form_necessary(device, make_application, mocker):
     app, znp_server = make_application(server_cls=device)
 
-    assert app.channel is None
-    assert app.channels is None
+    assert app.state.network_info.channel == 0
+    assert app.state.network_info.channel_mask == t.Channels.NO_CHANNELS
 
     await app.startup(auto_form=True)
 
-    assert app.channel is not None
-    assert app.channels is not None
+    assert app.state.network_info.channel != 0
+    assert app.state.network_info.channel_mask != t.Channels.NO_CHANNELS
 
     nvram = znp_server._nvram[ExNvIds.LEGACY]
 
@@ -278,7 +246,7 @@ async def test_auto_form_necessary(device, make_application, mocker):
 async def test_zstack_build_id_empty(device, make_application, mocker):
     app, znp_server = make_application(server_cls=device)
 
-    znp_server.reply_once_to(
+    znp_server.reply_to(
         c.SYS.Version.Req(),
         responses=c.SYS.Version.Rsp(
             TransportRev=2,
@@ -300,3 +268,43 @@ async def test_zstack_build_id_empty(device, make_application, mocker):
     assert app._zstack_build_id == 0x00000000
 
     await app.shutdown()
+
+
+@pytest.mark.parametrize("device", [FormedLaunchpadCC26X2R1])
+async def test_deprecated_concurrency_config(device, make_application):
+    with pytest.raises(vol.MultipleInvalid) as exc:
+        app, znp_server = make_application(
+            server_cls=device,
+            client_config={
+                conf.CONF_ZNP_CONFIG: {
+                    conf.CONF_MAX_CONCURRENT_REQUESTS: 16,
+                }
+            },
+        )
+
+    assert "max_concurrent_requests" in str(exc.value)
+
+
+@pytest.mark.parametrize("device", ALL_DEVICES)
+async def test_reset_network_info(device, make_application):
+    app, znp_server = make_application(server_cls=device)
+    await app.connect()
+    await app.reset_network_info()
+
+    with pytest.raises(NetworkNotFormed):
+        await app.start_network()
+
+
+@pytest.mark.parametrize(
+    "device, concurrency",
+    [
+        (FormedLaunchpadCC26X2R1, 16),
+        (FormedZStack1CC2531, 2),
+    ],
+)
+async def test_concurrency_auto_config(device, concurrency, make_application):
+    app, znp_server = make_application(server_cls=device)
+    await app.connect()
+    await app.start_network()
+
+    assert app._concurrent_requests_semaphore.max_value == concurrency

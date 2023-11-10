@@ -1,9 +1,11 @@
 import asyncio
 import contextlib
+from unittest import mock
 
 import pytest
 import zigpy.util
 import zigpy.types
+import zigpy.device
 import zigpy.zdo.types as zdo_t
 
 import zigpy_znp.types as t
@@ -38,7 +40,7 @@ async def test_permit_join(device, mocker, make_application):
         request=zdo_request_matcher(
             dst_addr=t.AddrModeAddress(t.AddrMode.Broadcast, 0xFFFC),
             command_id=zdo_t.ZDOCmd.Mgmt_Permit_Joining_req,
-            TSN=6,
+            TSN=7,
             zdo_PermitDuration=10,
             zdo_TC_Significant=0,
         ),
@@ -88,7 +90,7 @@ async def test_join_coordinator(device, make_application):
     )
 
     await app.startup(auto_form=False)
-    await app.permit(node=app.ieee)
+    await app.permit(node=app.state.node_info.ieee)
 
     await permit_join_coordinator
 
@@ -115,7 +117,7 @@ async def test_join_device(device, make_application):
                 IsBroadcast=t.Bool.false,
                 ClusterId=32822,
                 SecurityUse=0,
-                TSN=6,
+                TSN=7,
                 MacDst=0x0000,
                 Data=b"\x00",
             ),
@@ -155,10 +157,6 @@ async def test_permit_join_with_key(device, permit_result, make_application, moc
         ],
     )
 
-    mocker.patch.object(
-        app, "permit", new=CoroutineMock(side_effect=[None, permit_result])
-    )
-
     join_disable_install_code = znp_server.reply_once_to(
         c.AppConfig.BDBSetJoinUsesInstallCodeKey.Req(BdbJoinUsesInstallCodeKey=False),
         responses=[
@@ -168,6 +166,8 @@ async def test_permit_join_with_key(device, permit_result, make_application, moc
 
     await app.startup(auto_form=False)
 
+    mocker.patch.object(app, "permit", new=CoroutineMock(side_effect=permit_result))
+
     with contextlib.nullcontext() if permit_result is None else pytest.raises(
         asyncio.TimeoutError
     ):
@@ -175,7 +175,7 @@ async def test_permit_join_with_key(device, permit_result, make_application, moc
 
     await bdb_add_install_code
     await join_enable_install_code
-    assert app.permit.call_count == 2
+    assert app.permit.call_count == 1
 
     # The install code policy is reset right after
     await join_disable_install_code
@@ -202,7 +202,7 @@ async def test_on_zdo_device_join(device, make_application, mocker):
     app, znp_server = make_application(server_cls=device)
     await app.startup(auto_form=False)
 
-    mocker.patch.object(app, "handle_join")
+    mocker.patch.object(app, "handle_join", wraps=app.handle_join)
     mocker.patch("zigpy_znp.zigbee.application.DEVICE_JOIN_MAX_DELAY", new=0)
 
     nwk = 0x1234
@@ -222,7 +222,7 @@ async def test_on_zdo_device_join_and_announce_fast(device, make_application, mo
     app, znp_server = make_application(server_cls=device)
     await app.startup(auto_form=False)
 
-    mocker.patch.object(app, "handle_join")
+    mocker.patch.object(app, "handle_join", wraps=app.handle_join)
     mocker.patch("zigpy_znp.zigbee.application.DEVICE_JOIN_MAX_DELAY", new=0.5)
 
     nwk = 0x1234
@@ -271,9 +271,14 @@ async def test_on_zdo_device_join_and_announce_fast(device, make_application, mo
     # Everything is cleaned up
     assert not app._join_announce_tasks
 
-    await app.pre_shutdown()
+    await app.shutdown()
 
 
+@mock.patch("zigpy_znp.zigbee.application.DEVICE_JOIN_MAX_DELAY", new=0.1)
+@mock.patch(
+    "zigpy.device.Device._initialize",
+    new=zigpy.device.Device._initialize.__wrapped__,  # to disable retries
+)
 @pytest.mark.parametrize("device", FORMED_DEVICES)
 async def test_on_zdo_device_join_and_announce_slow(device, make_application, mocker):
     app, znp_server = make_application(server_cls=device)
@@ -284,8 +289,7 @@ async def test_on_zdo_device_join_and_announce_slow(device, make_application, mo
         responses=[c.ZDO.ExtRouteDisc.Rsp(Status=t.Status.SUCCESS)],
     )
 
-    mocker.patch.object(app, "handle_join")
-    mocker.patch("zigpy_znp.zigbee.application.DEVICE_JOIN_MAX_DELAY", new=0.1)
+    mocker.patch.object(app, "handle_join", wraps=app.handle_join)
 
     nwk = 0x1234
     ieee = t.EUI64.convert("11:22:33:44:55:66:77:88")
@@ -297,11 +301,13 @@ async def test_on_zdo_device_join_and_announce_slow(device, make_application, mo
     # We're waiting for the device to announce itself
     assert app.handle_join.call_count == 0
 
-    await asyncio.sleep(0.3)
+    # Wait for the trust center join timeout to elapse
+    while app.handle_join.call_count == 0:
+        await asyncio.sleep(0.1)
 
-    # Too late, it already happened
     app.handle_join.assert_called_once_with(nwk=nwk, ieee=ieee, parent_nwk=0x0001)
 
+    # Finally, send the device announcement
     znp_server.send(
         c.ZDO.MsgCbIncoming.Callback(
             Src=nwk,
@@ -329,113 +335,10 @@ async def test_on_zdo_device_join_and_announce_slow(device, make_application, mo
         )
     )
 
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.5)
 
     # The announcement will trigger another join indication
     assert app.handle_join.call_count == 2
 
-    await app.pre_shutdown()
-
-
-@pytest.mark.parametrize("device", FORMED_DEVICES)
-async def test_unknown_device_discovery(device, make_application, mocker):
-    app, znp_server = make_application(server_cls=device)
-    await app.startup(auto_form=False)
-
-    mocker.spy(app, "handle_join")
-
-    # Existing devices do not need to be discovered
-    existing_nwk = 0x1234
-    existing_ieee = t.EUI64(range(8))
-    device = app.add_initialized_device(ieee=existing_ieee, nwk=existing_nwk)
-
-    assert (await app._get_or_discover_device(nwk=existing_nwk)) is device
-    assert app.handle_join.call_count == 0
-
-    # If the device changes its NWK but doesn't tell zigpy, it will be re-discovered
-    did_ieee_addr_req1 = znp_server.reply_once_to(
-        request=c.ZDO.IEEEAddrReq.Req(
-            NWK=existing_nwk + 1,
-            RequestType=c.zdo.AddrRequestType.SINGLE,
-            StartIndex=0,
-        ),
-        responses=[
-            c.ZDO.IEEEAddrReq.Rsp(Status=t.Status.SUCCESS),
-            c.ZDO.IEEEAddrRsp.Callback(
-                Status=t.ZDOStatus.SUCCESS,
-                IEEE=existing_ieee,
-                NWK=existing_nwk + 1,
-                NumAssoc=0,
-                Index=0,
-                Devices=[],
-            ),
-        ],
-    )
-
-    # The same device is discovered and its NWK was updated. Handles concurrency.
-    devices = await asyncio.gather(
-        app._get_or_discover_device(nwk=existing_nwk + 1),
-        app._get_or_discover_device(nwk=existing_nwk + 1),
-        app._get_or_discover_device(nwk=existing_nwk + 1),
-        app._get_or_discover_device(nwk=existing_nwk + 1),
-        app._get_or_discover_device(nwk=existing_nwk + 1),
-    )
-
-    assert devices == [device] * 5
-
-    # Only a single request is sent, since the coroutines are grouped
-    await did_ieee_addr_req1
-    assert device.nwk == existing_nwk + 1
-    assert app.handle_join.call_count == 1
-
-    # If a completely unknown device joins the network, it will be treated as a new join
-    new_nwk = 0x5678
-    new_ieee = t.EUI64(range(1, 9))
-
-    did_ieee_addr_req2 = znp_server.reply_once_to(
-        request=c.ZDO.IEEEAddrReq.Req(
-            NWK=new_nwk,
-            RequestType=c.zdo.AddrRequestType.SINGLE,
-            StartIndex=0,
-        ),
-        responses=[
-            c.ZDO.IEEEAddrReq.Rsp(Status=t.Status.SUCCESS),
-            c.ZDO.IEEEAddrRsp.Callback(
-                Status=t.ZDOStatus.SUCCESS,
-                IEEE=new_ieee,
-                NWK=new_nwk,
-                NumAssoc=0,
-                Index=0,
-                Devices=[],
-            ),
-        ],
-    )
-
-    new_dev = await app._get_or_discover_device(nwk=new_nwk)
-    await did_ieee_addr_req2
-    assert app.handle_join.call_count == 2
-    assert new_dev.nwk == new_nwk
-    assert new_dev.ieee == new_ieee
-
-    await app.pre_shutdown()
-
-
-@pytest.mark.parametrize("device", FORMED_DEVICES)
-async def test_unknown_device_discovery_failure(device, make_application, mocker):
-    mocker.patch("zigpy_znp.zigbee.application.IEEE_ADDR_DISCOVERY_TIMEOUT", new=0.1)
-
-    app, znp_server = make_application(server_cls=device)
-    await app.startup(auto_form=False)
-
-    znp_server.reply_once_to(
-        request=c.ZDO.IEEEAddrReq.Req(partial=True),
-        responses=[
-            c.ZDO.IEEEAddrReq.Rsp(Status=t.Status.SUCCESS),
-        ],
-    )
-
-    # Discovery will throw an exception when the device cannot be found
-    with pytest.raises(KeyError):
-        await app._get_or_discover_device(nwk=0x3456)
-
-    await app.pre_shutdown()
+    app.get_device(ieee=ieee).cancel_initialization()
+    await app.shutdown()

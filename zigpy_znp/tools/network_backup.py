@@ -5,10 +5,10 @@ import json
 import asyncio
 import logging
 import datetime
+import importlib.metadata
 
 import zigpy.state
 
-import zigpy_znp
 import zigpy_znp.types as t
 from zigpy_znp.api import ZNP
 from zigpy_znp.tools.common import ClosableFileType, setup_parser, validate_backup_json
@@ -18,7 +18,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 def zigpy_state_to_json_backup(
-    network_info: zigpy.state.NetworkInformation, node_info: zigpy.state.NodeInfo
+    network_info: zigpy.state.NetworkInfo, node_info: zigpy.state.NodeInfo
 ) -> t.JSONType:
     devices = {}
 
@@ -29,12 +29,11 @@ def zigpy_state_to_json_backup(
             "is_child": False,
         }
 
-    for child in network_info.children:
-        devices[child.ieee] = {
-            "ieee_address": child.ieee.serialize()[::-1].hex(),
-            "nwk_address": child.nwk.serialize()[::-1].hex()
-            if child.nwk is not None
-            else None,
+    for ieee in network_info.children:
+        nwk = network_info.nwk_addresses.get(ieee, None)
+        devices[ieee] = {
+            "ieee_address": ieee.serialize()[::-1].hex(),
+            "nwk_address": nwk.serialize()[::-1].hex() if nwk is not None else None,
             "is_child": True,
         }
 
@@ -76,10 +75,7 @@ def zigpy_state_to_json_backup(
 
 
 async def backup_network(znp: ZNP) -> t.JSONType:
-    try:
-        await znp.load_network_info(load_devices=True)
-    except ValueError as e:
-        raise RuntimeError("Failed to load network info") from e
+    await znp.load_network_info(load_devices=True)
 
     obj = zigpy_state_to_json_backup(
         network_info=znp.network_info,
@@ -88,7 +84,7 @@ async def backup_network(znp: ZNP) -> t.JSONType:
 
     now = datetime.datetime.now().astimezone()
 
-    obj["metadata"]["source"] = f"zigpy-znp@{zigpy_znp.__version__}"
+    obj["metadata"]["source"] = f"zigpy-znp@{importlib.metadata.version('zigpy-znp')}"
     obj["metadata"]["internal"] = {
         "creation_time": now.isoformat(timespec="seconds"),
         "zstack": {

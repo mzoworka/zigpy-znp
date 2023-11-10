@@ -5,6 +5,7 @@ import logging
 import dataclasses
 
 import zigpy.state
+import zigpy.zdo.types as zdo_t
 
 import zigpy_znp.const as const
 import zigpy_znp.types as t
@@ -71,7 +72,7 @@ def iter_seed_candidates(
         yield count, tclk_seed
 
 
-async def read_tc_frame_counter(znp: ZNP, *, ext_pan_id: t.EUI64 = None) -> t.uint32_t:
+async def read_nwk_frame_counter(znp: ZNP, *, ext_pan_id: t.EUI64 = None) -> t.uint32_t:
     if ext_pan_id is None and znp.network_info is not None:
         ext_pan_id = znp.network_info.extended_pan_id
 
@@ -105,12 +106,12 @@ async def read_tc_frame_counter(znp: ZNP, *, ext_pan_id: t.EUI64 = None) -> t.ui
             global_entry = entry
 
     if global_entry is None:
-        raise ValueError("No security material entry was found for this network")
+        raise KeyError("No security material entry was found for this network")
 
     return global_entry.FrameCounter
 
 
-async def write_tc_frame_counter(
+async def write_nwk_frame_counter(
     znp: ZNP, counter: t.uint32_t, *, ext_pan_id: t.EUI64 = None
 ) -> None:
     if znp.version == 1.2:
@@ -272,14 +273,20 @@ async def read_devices(
             t.AddrMgrUserType.Assoc | t.AddrMgrUserType.Security,
             t.AddrMgrUserType.Security,
         ):
+            is_child = bool(entry.type & t.AddrMgrUserType.Assoc)
+
             devices[entry.extAddr] = StoredDevice(
                 node_info=zigpy.state.NodeInfo(
                     nwk=entry.nwkAddr,
                     ieee=entry.extAddr,
-                    logical_type=None,
+                    logical_type=(
+                        zdo_t.LogicalType.EndDevice
+                        if is_child
+                        else zdo_t.LogicalType.Router
+                    ),
                 ),
                 key=None,
-                is_child=bool(entry.type & t.AddrMgrUserType.Assoc),
+                is_child=is_child,
             )
         else:
             raise ValueError(f"Unexpected entry type: {entry.type}")
