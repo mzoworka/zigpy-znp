@@ -364,7 +364,7 @@ class SYS(t.CommandsBase, subsystem=t.Subsystem.SYS):
             t.Param("Value", t.uint8_t, "Tuning value"),
         ),
         rsp_schema=(
-            (t.Param("Value", t.uint8_t, "Applicable status of the tuning operation"),)
+            t.Param("Value", t.uint8_t, "Applicable status of the tuning operation"),
         ),
     )
 
